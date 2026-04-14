@@ -1,0 +1,174 @@
+# Configuration Examples for Quant Bot
+
+# Run with: python -m src.backtest --config config/backtest.yml
+
+# ============================================================================
+# BACKTEST CONFIGURATION
+# ============================================================================
+
+# Copy to backtest.yml for backtesting mode
+backtest:
+  name: "Vol Mean Reversion - Phase 1"
+  mode: backtest
+  
+  date_range:
+    start_date: "2023-01-01"
+    end_date: "2023-12-31"
+  
+  symbols:
+    - SPY
+    - SPX
+  
+  timeframes:
+    - 1m
+    - 5m
+    - 15m
+    - 1h
+  
+  # Data source (mock for now, replace with API)
+  data_source:
+    type: csv  # 'csv', 'api', 'database'
+    path: data/historical_ticks.csv
+
+  # Strategy configuration
+  strategy:
+    type: VolatilityMeanReversion
+    parameters:
+      iv_percentile_threshold: 20
+      position_size: 10
+      stop_loss_pct: 0.02
+      take_profit_pct: 0.05
+
+  # Risk management
+  risk:
+    max_portfolio_delta: 5000
+    max_portfolio_gamma: 1000
+    max_position_size: 50
+    max_daily_loss_pct: 0.02
+    max_drawdown_pct: 0.10
+
+  # Execution parameters
+  execution:
+    order_type: market
+    slippage_bps: 2  # 2 basis point slippage
+    commission_per_contract: 0.65
+
+  # Output
+  output:
+    report_file: "reports/backtest_results.html"
+    save_trades: true
+    save_daily_pnl: true
+
+
+# ============================================================================
+# LIVE TRADING CONFIGURATION
+# ============================================================================
+
+# Copy to live.yml for live trading (use with caution!)
+live:
+  name: "Live Trading - Production"
+  mode: live
+  paper_trading: true  # Set to false only after thorough testing!
+  
+  # Market data (requires API credentials)
+  data:
+    provider: "[API: Interactive Brokers / Polygon]"
+    api_key: "${IB_ACCOUNT}"  # Load from environment
+    account_id: "${IB_ACCOUNT_ID}"
+  
+  symbols:
+    - SPY
+    - SPX
+  
+  # Strategy
+  strategy:
+    type: GammaScalping
+    parameters:
+      gamma_threshold: 0.01
+      rebalance_delta: 0.05
+      max_hold_minutes: 30
+  
+  # Risk limits (STRICT for live)
+  risk:
+    max_portfolio_delta: 2000  # Tighter for live
+    max_portfolio_gamma: 500
+    max_position_size: 20
+    max_daily_loss_pct: 0.01  # 1% max daily loss
+    max_drawdown_pct: 0.05  # 5% max drawdown
+    max_orders_per_minute: 20
+  
+  # Execution
+  execution:
+    broker: "interactive_brokers"
+    order_type: limit
+    limit_price_offset_bps: 5  # 5 bps inside market
+    cancel_unexecuted_seconds: 30
+  
+  # Monitoring & Alerts
+  monitoring:
+    risk_check_interval_seconds: 5
+    portfolio_log_interval_seconds: 60
+    slack_webhook: "${SLACK_WEBHOOK_URL}"
+    email_on_error: "dev@example.com"
+
+
+# ============================================================================
+# DATABASE CONFIGURATION
+# ============================================================================
+
+database:
+  type: postgresql
+  connection:
+    host: localhost
+    port: 5432
+    database: quant_trading
+    user: postgres
+    password: "${DB_PASSWORD}"  # Load from environment
+  
+  options:
+    pool_size: 5
+    max_overflow: 10
+    pool_recycle: 3600
+
+
+# ============================================================================
+# LOGGING CONFIGURATION
+# ============================================================================
+
+logging:
+  level: DEBUG  # DEBUG, INFO, WARNING, ERROR
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  
+  # File output
+  file:
+    enabled: true
+    path: "logs/quant_bot.log"
+    max_bytes: 104857600  # 100MB
+    backup_count: 10
+  
+  # Console output
+  console:
+    enabled: true
+    level: INFO
+
+
+# ============================================================================
+# NOTIFICATION/ALERTING
+# ============================================================================
+
+notifications:
+  enabled: true
+  
+  # Slack notifications
+  slack:
+    enabled: false
+    webhook_url: "${SLACK_WEBHOOK_URL}"
+    channels:
+      - "#trading-alerts"
+  
+  # Email alerts
+  email:
+    enabled: false
+    recipients:
+      - "dev@example.com"
+    subject_prefix: "[QuantBot Alert]"

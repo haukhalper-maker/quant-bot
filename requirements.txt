@@ -1,0 +1,93 @@
+# Core Scientific Stack
+numpy>=1.24.0
+pandas>=2.0.0
+scipy>=1.10.0
+scikit-learn>=1.3.0
+
+# Time Series & Analysis
+pandas-ta>=0.3.14b
+ta-lib>=0.4.28
+statsmodels>=0.13.5
+
+# Quantitative Finance
+py_vollib>=1.3.2
+quantlib>=1.31
+numpy-financial>=1.0.0
+
+# Options & Greeks
+mibian>=0.1.2
+scipy>=1.10.0
+
+# Market Data & Execution [API PLACEHOLDERS]
+# Replace with your chosen brokers/feeds (IB, Polygon, Alpaca, etc.)
+# Interactive Brokers: ibapi>=9.81
+# Alpaca: alpaca-trade-api>=3.0
+# Polygon: polygon-api-client>=1.11
+# Tastytrade: tastytrade>=1.0.0
+
+# Database
+psycopg2-binary>=2.9.0
+sqlalchemy>=2.0.0
+sqlalchemy-utils>=0.41.0
+pymongo>=4.5.0  # Optional: if using MongoDB
+
+# Data Processing
+arrow>=1.2.0
+python-dateutil>=2.8.0
+
+# Real-time & Async
+asyncio-contextmanager>=1.0.0
+aiohttp>=3.9.0
+websockets>=12.0
+python-socketio>=5.9.0
+
+# Backtesting
+backtrader>=1.10.0
+zipline-reloaded>=3.1.0
+
+# Performance
+numba>=0.57.0
+cython>=0.29.0
+bottleneck>=1.3.7
+
+# Visualization & Monitoring
+matplotlib>=3.7.0
+plotly>=5.14.0
+seaborn>=0.12.0
+
+# Logging & Monitoring
+loguru>=0.7.0
+structlog>=23.1.0
+prometheus-client>=0.17.0
+
+# Configuration
+pydantic>=2.0.0
+python-dotenv>=1.0.0
+pyyaml>=6.0
+
+# Testing
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
+pytest-cov>=4.1.0
+hypothesis>=6.87.0
+
+# Type Checking
+mypy>=1.5.0
+typing-extensions>=4.8.0
+
+# Code Quality
+black>=23.10.0
+flake8>=6.1.0
+isort>=5.12.0
+pylint>=3.0.0
+
+# CLI & Development
+click>=8.1.0
+rich>=13.6.0
+ipython>=8.15.0
+jupyter>=1.0.0
+notebook>=7.0.0
+
+# Utilities
+requests>=2.31.0
+tqdm>=4.66.0

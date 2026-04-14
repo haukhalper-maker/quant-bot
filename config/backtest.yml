@@ -1,0 +1,44 @@
+# Backtest Configuration Template
+# Copy this to config/backtest.yml for your backtesting setup
+
+backtest:
+  name: "SPY/SPX Options Backtest"
+  mode: backtest
+  
+  date_range:
+    start_date: "2023-01-01"
+    end_date: "2023-12-31"
+  
+  symbols:
+    - SPY
+    - SPX
+  
+  data_source:
+    type: tastytrade  # 'mock' for testing, 'tastytrade' for real data
+    api_key: "${TASTYTRADE_API_KEY}"  # Set environment variable
+    api_secret: "${TASTYTRADE_API_SECRET}"  # Set environment variable
+  
+  strategies:
+    - type: VolatilityMeanReversion
+      parameters:
+        iv_percentile_threshold: 20
+        position_size: 10
+        stop_loss_pct: 0.02
+        take_profit_pct: 0.05
+  
+  risk:
+    max_portfolio_delta: 5000
+    max_portfolio_gamma: 1000
+    max_position_size: 50
+    max_daily_loss_pct: 0.02
+    max_drawdown_pct: 0.10
+  
+  execution:
+    slippage_bps: 2  # 2 basis points slippage
+    commission_per_contract: 0.65
+  
+  output:
+    save_results: true
+    results_file: "results/backtest_results.json"
+    save_trades: true
+    trades_file: "results/trades.csv"
