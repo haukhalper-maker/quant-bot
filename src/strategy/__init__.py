@@ -195,7 +195,9 @@ class VolatilityMeanReversionStrategy(Strategy):
             return None
 
         realized_vol = self._realized_vol(sym)
-        implied_vol = self._get_iv(sym)
+        # Use live IV from candle if the connector injected it; otherwise AR(1) simulation.
+        iv_override = getattr(candle, "implied_vol", None)
+        implied_vol = self._get_iv(sym, override=iv_override)
         if implied_vol is None:
             return None
 
@@ -220,22 +222,53 @@ class VolatilityMeanReversionStrategy(Strategy):
         log_rets = np.diff(np.log(prices[-n:]))
         return float(np.std(log_rets) * np.sqrt(252))
 
-    def _get_iv(self, symbol: str) -> Optional[float]:
+    def seed_iv_history(self, symbol: str, history: List[float]) -> None:
         """
-        Placeholder: in live mode this comes from options market data.
-        In paper/backtest mode we simulate with a realistic mean-reverting process.
+        Pre-populate IV history for `symbol` with real data.
+
+        Called at bot startup by TastytradeConnector.seed_iv_history().
+        Overrides any existing history so the initial _iv_percentile()
+        reading is anchored to real market data rather than random noise.
         """
+        if history:
+            self._iv_history[symbol] = list(history)
+            logger.info(
+                f"[{self.name}] Seeded {len(history)}-day IV history for {symbol}: "
+                f"current={history[-1]:.2%}  min={min(history):.2%}  "
+                f"max={max(history):.2%}"
+            )
+
+    def _get_iv(self, symbol: str, override: Optional[float] = None) -> Optional[float]:
+        """
+        Return implied vol for `symbol`.
+
+        Priority:
+          1. `override` — real IV injected from TastytradeConnector via
+             candle.implied_vol (set by QuantBot._on_candle before calling
+             strategy.on_candle).  Appended to history so percentile
+             tracking stays current.
+          2. AR(1) continuation — if history exists but no live feed,
+             extend from the last known value.  Uses a tighter noise
+             parameter (0.005) than the old simulation (0.008) so the
+             synthetic readings don't drift far from the seeded anchor.
+          3. Random seed — first call only, no history, no live feed.
+             Fallback for pure offline/backtest use.
+        """
+        if override is not None:
+            return float(max(0.04, min(0.90, override)))
+
         hist = self._iv_history.get(symbol, [])
         if hist:
-            # AR(1) mean-reverting IV process
+            # AR(1) continuation from last real (or simulated) value
             prev = hist[-1]
             long_run_mean = 0.20
             mean_rev_speed = 0.05
-            noise = np.random.normal(0, 0.008)
+            noise = np.random.normal(0, 0.005)
             iv = prev + mean_rev_speed * (long_run_mean - prev) + noise
-            return float(max(0.05, min(0.80, iv)))
-        # Initial seed
-        return float(np.random.normal(0.20, 0.04))
+            return float(max(0.04, min(0.90, iv)))
+
+        # No history at all — seed with a plausible random value
+        return float(np.clip(np.random.normal(0.20, 0.04), 0.05, 0.60))
 
     def _iv_percentile(self, symbol: str, current_iv: float) -> float:
         hist = self._iv_history.get(symbol, [])
@@ -549,55 +582,209 @@ class GammaScalpingStrategy(Strategy):
 
 class GammaImbalanceTrader(Strategy):
     """
-    Trades dealer gamma concentrations (gamma walls).
+    Trades dealer gamma imbalances (gamma walls / GEX).
 
-    When dealers are net short gamma at key strike levels, the market tends
-    to be more volatile and directional near those strikes. When long gamma,
-    the market reverts.
+    Concept
+    -------
+    When market-makers are net SHORT gamma near spot (large negative GEX),
+    they must sell into rallies and buy dips to delta-hedge, amplifying moves.
+    A straddle benefits from this vol expansion.
 
-    Requires: open interest by strike and calculated dealer gamma positioning.
+    When dealers are net LONG gamma (positive GEX), they dampen moves and
+    the market tends to pin — no trade is taken.
+
+    Data pipeline
+    -------------
+    update_gamma_skew(symbol, gamma_skew) is called by QuantBot after each
+    options chain refresh.  gamma_skew is a dict {strike: net_dealer_gamma}
+    produced by TastytradeConnector.get_dealer_gamma_skew().
+
+    Entry condition (fixed)
+    -----------------------
+    BUG in original code:
+      `net_gamma < -imbalance_threshold * abs(net_gamma)`
+    expands to `net_gamma < imbalance_threshold * net_gamma` when net_gamma < 0,
+    which simplifies to `1 < imbalance_threshold` — always False for threshold=1.5.
+    The condition was mathematically impossible to trigger.
+
+    Fixed condition:
+      net_gamma < -imbalance_threshold
+    Meaning: the summed dealer gamma within 3% of spot is more negative than
+    the threshold (threshold is in BSM gamma units per share, typically ~1e-3
+    for SPY near ATM).
+
+    Position tracking
+    -----------------
+    One open position per symbol.  After an entry signal the strategy waits
+    for confirm_entry() before considering a new signal.  Exits on:
+      1. DTE ≤ 7 (roll risk)
+      2. IV regime flip (net_gamma crosses to positive — dealers now long gamma)
+      3. Max hold exceeded
     """
 
-    def __init__(self, imbalance_threshold: float = 1.5):
+    def __init__(
+        self,
+        imbalance_threshold: float = 1e-4,   # BSM gamma units (≈ ATM gamma on $100 stock)
+        near_strike_pct: float = 0.03,        # strikes within 3% of spot
+        max_hold_days: int = 14,
+        dte_close: int = 7,
+    ):
         super().__init__("GammaImbalance")
         self.imbalance_threshold = imbalance_threshold
-        self._gamma_skew: Dict[str, Dict[float, float]] = {}  # symbol → {strike: dealer_gamma}
+        self.near_strike_pct = near_strike_pct
+        self.max_hold_days = max_hold_days
+        self.dte_close = dte_close
+
+        self._gamma_skew: Dict[str, Dict[float, float]] = {}   # symbol → {strike: dealer_gamma}
+        self._positions: Dict[str, dict] = {}                  # symbol → position state
+        self._last_signal: Dict[str, datetime] = {}
 
     def update_gamma_skew(self, symbol: str, gamma_skew: Dict[float, float]) -> None:
-        """Feed dealer gamma positioning data (from open interest analysis)."""
+        """
+        Inject dealer gamma positioning data produced by
+        TastytradeConnector.get_dealer_gamma_skew().
+        Called by QuantBot after each options chain refresh (every ~5 min).
+        """
         self._gamma_skew[symbol] = gamma_skew
+        total = sum(gamma_skew.values())
+        logger.debug(
+            f"[GammaImbalance] Gamma skew updated for {symbol}: "
+            f"{len(gamma_skew)} strikes  net_total={total:.6f}"
+        )
+
+    def confirm_entry(self, symbol: str) -> None:
+        """Called by the execution layer after a fill is confirmed."""
+        pos = self._positions.get(symbol)
+        if pos and not pos.get("confirmed", False):
+            pos["confirmed"] = True
+            logger.info(f"[GammaImbalance] Entry confirmed for {symbol} — exit monitoring active")
+
+    def on_signal_rejected(self, symbol: str) -> None:
+        """Clear unconfirmed position if the signal was rejected."""
+        pos = self._positions.get(symbol)
+        if pos and not pos.get("confirmed", False):
+            del self._positions[symbol]
+
+    @staticmethod
+    def _next_expiry_dte(target_dte: int = 14, ref_date=None) -> str:
+        """Return the next weekly expiry approximately `target_dte` calendar days out."""
+        from datetime import date, timedelta
+        today = ref_date or date.today()
+        target = today + timedelta(days=target_dte)
+        days_to_fri = (4 - target.weekday()) % 7
+        expiry = target + timedelta(days=days_to_fri)
+        return expiry.strftime("%Y-%m-%d")
+
+    @staticmethod
+    def _dte(expiry_str: str, ref: datetime) -> float:
+        try:
+            exp = datetime.strptime(expiry_str, "%Y-%m-%d")
+            return max(0.0, (exp - ref).days)
+        except (ValueError, TypeError):
+            return 14.0
 
     async def on_tick(self, tick) -> Optional[Signal]:
         sym = tick.symbol
-        skew = self._gamma_skew.get(sym, {})
+        skew = self._gamma_skew.get(sym)
         if not skew:
             return None
 
-        near = {
-            k: v for k, v in skew.items()
-            if abs(k - tick.price) / max(tick.price, 1) < 0.03  # within 3% of spot
-        }
-        if not near:
+        now = datetime.utcnow()
+        pos = self._positions.get(sym, {})
+
+        # ------------------------------------------------------------------ #
+        # EXIT — only after confirm_entry()                                    #
+        # ------------------------------------------------------------------ #
+        if pos and pos.get("confirmed", False):
+            entry_time: datetime = pos["entry_time"]
+            expiry_str: str = pos.get("expiry", "")
+            days_held = (now - entry_time).days
+            dte = self._dte(expiry_str, now)
+
+            exit_reason: Optional[str] = None
+
+            # Rule 1 — DTE management
+            if dte <= self.dte_close:
+                exit_reason = f"dte_{int(dte)}_management"
+
+            # Rule 2 — gamma regime flipped (dealers now long gamma → market reverts)
+            elif self._net_gamma_near(skew, tick.price) >= 0:
+                exit_reason = "gamma_regime_flip_long"
+
+            # Rule 3 — max hold
+            elif days_held >= self.max_hold_days:
+                exit_reason = "max_hold_exceeded"
+
+            if exit_reason:
+                self._positions[sym] = {}
+                self._last_signal[sym] = now
+                return self._emit(Signal(
+                    signal_type=SignalType.CLOSE_POSITION,
+                    symbol=sym,
+                    timestamp=now,
+                    strike=tick.price,
+                    expiry=expiry_str or self._next_expiry_dte(14),
+                    confidence=0.85,
+                    position_size=1,
+                    strategy_name=self.name,
+                    metadata={
+                        "days_held": days_held,
+                        "dte": dte,
+                        "reason": exit_reason,
+                    },
+                ))
+
+        # ------------------------------------------------------------------ #
+        # ENTRY — one position per symbol, 4-hour cooldown                    #
+        # ------------------------------------------------------------------ #
+        if pos:
+            return None  # already in a position
+
+        last = self._last_signal.get(sym)
+        if last and (now - last).total_seconds() < 4 * 3600:
             return None
 
-        net_gamma = sum(near.values())
-        if abs(net_gamma) < 0.001:
+        net_gamma = self._net_gamma_near(skew, tick.price)
+        if abs(net_gamma) < 1e-10:
             return None
 
-        # Short gamma environment → expect trending move, trade with momentum
-        if net_gamma < -self.imbalance_threshold * abs(net_gamma):
+        # FIXED condition: dealers net short gamma → expect trending/volatile move
+        # Original bug: `net_gamma < -threshold * abs(net_gamma)` is always False.
+        # Fixed: `net_gamma < -threshold` (direct magnitude check)
+        if net_gamma < -self.imbalance_threshold:
+            expiry = self._next_expiry_dte(14, ref_date=now.date())
+            confidence = min(0.50 + abs(net_gamma) / (self.imbalance_threshold + 1e-10) * 0.15, 0.85)
+            self._last_signal[sym] = now
+            self._positions[sym] = {
+                "entry_time": now,
+                "expiry": expiry,
+                "net_gamma_entry": net_gamma,
+                "confirmed": False,
+            }
             return self._emit(Signal(
                 signal_type=SignalType.STRADDLE,
                 symbol=sym,
-                timestamp=datetime.utcnow(),
+                timestamp=now,
                 strike=tick.price,
-                expiry="",
-                confidence=0.60,
+                expiry=expiry,
+                confidence=round(confidence, 2),
                 position_size=1,
                 strategy_name=self.name,
-                metadata={"net_dealer_gamma": net_gamma, "regime": "short_gamma"},
+                metadata={
+                    "net_dealer_gamma": net_gamma,
+                    "imbalance_threshold": self.imbalance_threshold,
+                    "regime": "short_gamma_wall",
+                },
             ))
         return None
+
+    def _net_gamma_near(self, skew: Dict[float, float], spot: float) -> float:
+        """Sum dealer gamma for strikes within near_strike_pct of spot."""
+        near = {
+            k: v for k, v in skew.items()
+            if abs(k - spot) / max(spot, 1.0) < self.near_strike_pct
+        }
+        return sum(near.values()) if near else 0.0
 
     async def on_candle(self, candle) -> Optional[Signal]:
         return None

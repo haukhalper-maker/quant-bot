@@ -21,7 +21,7 @@ import pandas as pd
 from loguru import logger
 
 from src.core import EventLoop, BotConfig, setup_logging, Event, EventType
-from src.market_data import MockDataConnector, TastytradeConnector, Candle, Tick
+from src.market_data import MockDataConnector, TastytradeConnector, Candle, Tick, DeviceChallengeRequired
 from src.analysis import AnalysisEngine
 from src.strategy import (
     VolatilityMeanReversionStrategy,
@@ -116,6 +116,28 @@ class QuantBot:
         await self.data_connector.connect()
         self._setup_event_subscriptions()
         logger.info(f"Data connector: {self.data_connector.name}")
+        await self._seed_iv_histories()
+
+    async def _seed_iv_histories(self) -> None:
+        """
+        Pre-populate 30-day IV history in all strategies from Tastytrade
+        market metrics.  Called once at startup.
+
+        Without this, VolatilityMeanReversionStrategy uses an AR(1) process
+        seeded from a random Gaussian — the IV percentile reading is garbage
+        for the first 30+ candles.  With real data the percentile is correct
+        from candle 1.
+        """
+        if not isinstance(self.data_connector, TastytradeConnector):
+            return
+        for sym in self.config.symbols:
+            try:
+                history = await self.data_connector.seed_iv_history(sym, days=30)
+                for strategy in self.rule_engine.strategies:
+                    if hasattr(strategy, "seed_iv_history"):
+                        strategy.seed_iv_history(sym, history)
+            except Exception as exc:
+                logger.warning(f"IV history seeding failed for {sym}: {exc}")
 
     async def run(self) -> None:
         try:
@@ -178,6 +200,18 @@ class QuantBot:
         self.analysis.on_price(tick.symbol, tick.price)
         self.executor.set_market_price(tick.symbol, tick.price)
 
+        # Refresh dealer gamma skew for GammaImbalanceTrader (throttled inside connector)
+        if isinstance(self.data_connector, TastytradeConnector):
+            try:
+                skew = await self.data_connector.get_dealer_gamma_skew(
+                    tick.symbol, tick.price
+                )
+                for strategy in self.rule_engine.strategies:
+                    if hasattr(strategy, "update_gamma_skew"):
+                        strategy.update_gamma_skew(tick.symbol, skew)
+            except Exception as exc:
+                logger.debug(f"Gamma skew refresh failed for {tick.symbol}: {exc}")
+
         # Collect signals from all strategies
         signals = []
         for strategy in self.rule_engine.strategies:
@@ -189,9 +223,28 @@ class QuantBot:
             await self._process_signals(signals, current_price=tick.price)
 
     async def _on_candle(self, candle: Candle) -> None:
-        """Process a candle through the full pipeline."""
+        """
+        Process a candle through the full pipeline.
+
+        If connected to Tastytrade, inject real IV into the candle before
+        passing it to strategies.  This replaces the AR(1) simulation in
+        VolatilityMeanReversionStrategy._get_iv() with real market data.
+        """
         self.analysis.on_price(candle.symbol, candle.close)
         self.executor.set_market_price(candle.symbol, candle.close)
+
+        # Inject live IV from Tastytrade into the candle
+        if isinstance(self.data_connector, TastytradeConnector):
+            try:
+                metrics = await self.data_connector.get_market_metrics(candle.symbol)
+                m = metrics.get(candle.symbol, {})
+                if m:
+                    candle.implied_vol = m.get("iv")
+                    candle.iv_rank = m.get("iv_rank")
+                    candle.hv30 = m.get("hv30")
+                    self.analysis.on_iv(candle.symbol, candle.implied_vol)
+            except Exception as exc:
+                logger.debug(f"IV injection failed for {candle.symbol}: {exc}")
 
         signals = []
         for strategy in self.rule_engine.strategies:
@@ -668,6 +721,110 @@ def llm_check():
             click.echo("  Start Ollama:    ollama run llama3.1:8b")
             click.echo("  Start LM Studio: ensure local server is running on port 1234")
         await client.close()
+
+    asyncio.run(_check())
+
+
+@cli.command("tastytrade-check")
+def tastytrade_check():
+    """
+    Test the Tastytrade API connection.
+
+    Prints: connection status, account list, and current SPY / SPX IV metrics.
+    Requires TASTYTRADE_USERNAME and TASTYTRADE_PASSWORD in .env.
+
+    Usage:
+        python -m src.main tastytrade-check
+    """
+    async def _check():
+        connector = TastytradeConnector()
+
+        click.echo("\n" + "=" * 60)
+        click.echo("  TASTYTRADE CONNECTION CHECK")
+        click.echo("=" * 60)
+
+        # ── Connect ──────────────────────────────────────────────────
+        click.echo(f"\nConnecting as: {connector.username!r} ...")
+        try:
+            await connector.connect()
+        except DeviceChallengeRequired as exc:
+            click.echo(f"\n[OTP REQUIRED] {exc}")
+            code = click.prompt("  Enter the OTP code from your phone/email").strip()
+            try:
+                await connector.connect(otp=code)
+            except Exception as exc2:
+                click.echo(f"[FAIL] OTP authentication failed: {exc2}")
+                return
+        except Exception as exc:
+            click.echo(f"[FAIL] Connection error: {exc}")
+            return
+
+        click.echo("[OK] Connected\n")
+
+        # ── Accounts ─────────────────────────────────────────────────
+        accounts = connector.get_accounts()
+        click.echo(f"Accounts ({len(accounts)}):")
+        for acc in accounts:
+            click.echo(
+                f"  {acc.get('account-number', '?'):>12}  "
+                f"{acc.get('account-type-name', '?'):<20} "
+                f"{acc.get('nickname', '')}"
+            )
+
+        # ── Market metrics ───────────────────────────────────────────
+        symbols = ["SPY", "SPX"]
+        click.echo(f"\nMarket Metrics — {', '.join(symbols)}")
+        click.echo("-" * 55)
+        try:
+            metrics = await connector.get_market_metrics(*symbols)
+        except Exception as exc:
+            click.echo(f"[FAIL] market-metrics error: {exc}")
+            await connector.disconnect()
+            return
+
+        for sym in symbols:
+            m = metrics.get(sym, {})
+            if not m:
+                click.echo(f"  {sym}: no data returned")
+                continue
+            iv     = m.get("iv", 0.0)
+            iv_r   = m.get("iv_rank", 0.0)
+            iv_p   = m.get("iv_pct", 0.0)
+            hv30   = m.get("hv30", 0.0)
+            iv_rv  = iv / max(hv30, 0.001)
+            click.echo(
+                f"  {sym:<5}  IV={iv:.1%}  IVR={iv_r:.0f}  "
+                f"IV%ile={iv_p:.0f}  HV30={hv30:.1%}  IV/HV={iv_rv:.2f}"
+            )
+
+        # ── IV history seed ─────────────────────────────────────────
+        click.echo("\nIV History Seed (30 days, SPY):")
+        try:
+            hist = await connector.seed_iv_history("SPY", days=30)
+            click.echo(
+                f"  min={min(hist):.2%}  max={max(hist):.2%}  "
+                f"current={hist[-1]:.2%}  samples={len(hist)}"
+            )
+        except Exception as exc:
+            click.echo(f"  [WARN] seed failed: {exc}")
+
+        # ── Option chain ─────────────────────────────────────────────
+        click.echo("\nOption chain (SPY, first 3 expirations):")
+        try:
+            exps = await connector.get_nested_chain("SPY")
+            for exp in exps[:3]:
+                n_strikes = len(exp.get("strikes", []))
+                click.echo(
+                    f"  {exp.get('expiration-date', '?')}  "
+                    f"DTE={exp.get('days-to-expiration', '?'):>3}  "
+                    f"strikes={n_strikes}"
+                )
+        except Exception as exc:
+            click.echo(f"  [WARN] option chain error: {exc}")
+
+        click.echo("\n" + "=" * 60)
+        await connector.disconnect()
+        click.echo("[OK] Disconnected cleanly\n")
 
     asyncio.run(_check())
 
