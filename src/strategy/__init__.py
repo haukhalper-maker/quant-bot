@@ -176,6 +176,10 @@ class VolatilityMeanReversionStrategy(Strategy):
         self._positions: Dict[str, Dict] = {}
         self._last_signal: Dict[str, datetime] = {} # symbol → last entry signal time
 
+        # Kelly criterion: rolling trade log for dynamic position sizing
+        self._trade_log: List[float] = []   # per-trade realized P&L (dollars, estimated)
+        self._capital: float = 100_000.0    # updated by update_portfolio_state()
+
     async def on_tick(self, tick) -> Optional[Signal]:
         sym = tick.symbol
         self._price_history.setdefault(sym, []).append(tick.price)
@@ -286,6 +290,43 @@ class VolatilityMeanReversionStrategy(Strategy):
         if last is None:
             return True
         return now - last >= self.min_signal_interval
+
+    def update_portfolio_state(
+        self, current_value: float, peak_value: float, capital: float
+    ) -> None:
+        """Receive current portfolio value from the simulation loop (used for Kelly sizing)."""
+        self._capital = capital
+
+    def _kelly_position_size(self, risk_per_contract: float) -> int:
+        """
+        Quarter-Kelly position sizing from rolling trade history.
+
+        f* = (win_rate * avg_win - loss_rate * avg_loss) / avg_win
+        f_quarter = f* * 0.25   (standard safety scaling)
+        contracts = floor(capital * f_quarter / risk_per_contract)
+
+        Falls back to 1 contract if fewer than 10 completed trades.
+        Capped at 10 contracts to limit single-trade risk.
+        """
+        if len(self._trade_log) < 10 or risk_per_contract <= 0:
+            return 1
+        wins   = [p for p in self._trade_log if p > 0]
+        losses = [abs(p) for p in self._trade_log if p < 0]
+        if not wins or not losses:
+            return 1
+
+        win_rate  = len(wins) / len(self._trade_log)
+        loss_rate = 1.0 - win_rate
+        avg_win   = float(np.mean(wins))
+        avg_loss  = float(np.mean(losses))
+
+        if avg_win <= 0:
+            return 1
+        f_star    = (win_rate * avg_win - loss_rate * avg_loss) / avg_win
+        f_quarter = max(0.0, f_star * 0.25)
+
+        contracts = max(1, int(f_quarter * self._capital / risk_per_contract))
+        return min(contracts, 10)
 
     def _next_expiry(self, weeks_out: int = 4, ref_date=None) -> str:
         """Return the next options expiry (weekly, ~N weeks out) from ref_date."""
@@ -477,6 +518,10 @@ class VolatilityMeanReversionStrategy(Strategy):
                     else:
                         est_pnl = (current_premium - entry_premium) * 100
                     pnl_str = f"+${est_pnl:.2f}" if est_pnl >= 0 else f"-${abs(est_pnl):.2f}"
+                    # Feed into Kelly rolling log so future entries size correctly
+                    self._trade_log.append(est_pnl)
+                    if len(self._trade_log) > 200:       # keep rolling 200-trade window
+                        self._trade_log = self._trade_log[-200:]
                 else:
                     pnl_str = "n/a"
 
@@ -526,6 +571,9 @@ class VolatilityMeanReversionStrategy(Strategy):
             expiry = self._next_expiry(weeks_out=4, ref_date=now.date())
             T_entry = (4 * 7) / 365.0
             entry_premium = self._straddle_value(candle.close, candle.close, implied_vol, T_entry)
+            # Kelly: risk on long straddle = premium paid if it expires worthless
+            risk_per_contract = max(entry_premium * 100, 1.0)
+            position_size = self._kelly_position_size(risk_per_contract)
             self._last_signal[sym] = now
             self._positions[sym] = {
                 "type": "long",
@@ -545,7 +593,7 @@ class VolatilityMeanReversionStrategy(Strategy):
                 strike=candle.close,
                 expiry=expiry,
                 confidence=min(conf, 1.0),
-                position_size=1,
+                position_size=position_size,
                 strategy_name=self.name,
                 metadata={
                     "iv_percentile": iv_pct,
@@ -554,6 +602,7 @@ class VolatilityMeanReversionStrategy(Strategy):
                     "implied_vol": implied_vol,
                     "entry_premium": entry_premium,
                     "reason": "buy_cheap_vol",
+                    "kelly_contracts": position_size,
                 },
             ))
 
@@ -567,6 +616,9 @@ class VolatilityMeanReversionStrategy(Strategy):
             entry_premium = self._condor_net_value(
                 S=candle.close, entry_spot=candle.close, iv=implied_vol, T=T_entry
             )
+            # Kelly: max loss on condor = stop_loss_mult × credit received
+            risk_per_contract = max(self.stop_loss_mult * entry_premium * 100, 1.0)
+            position_size = self._kelly_position_size(risk_per_contract)
             self._last_signal[sym] = now
             self._positions[sym] = {
                 "type": "short",
@@ -586,7 +638,7 @@ class VolatilityMeanReversionStrategy(Strategy):
                 strike=candle.close,
                 expiry=expiry,
                 confidence=min(conf, 1.0),
-                position_size=1,
+                position_size=position_size,
                 strategy_name=self.name,
                 metadata={
                     "iv_percentile": iv_pct,
@@ -595,6 +647,7 @@ class VolatilityMeanReversionStrategy(Strategy):
                     "implied_vol": implied_vol,
                     "entry_premium": entry_premium,
                     "reason": "sell_rich_vol",
+                    "kelly_contracts": position_size,
                 },
             ))
 

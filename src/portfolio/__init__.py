@@ -269,6 +269,7 @@ class PortfolioManager:
         strategy_name: str = "",
         signal_type: str = "",
         llm_reasoning: str = "",
+        entry_time: Optional[datetime] = None,
     ) -> OptionPosition:
         """Open a new position and debit/credit cash."""
         self._pos_counter += 1
@@ -283,7 +284,7 @@ class PortfolioManager:
             expiry=expiry,
             quantity=quantity,
             entry_price=entry_price,
-            entry_time=datetime.utcnow(),
+            entry_time=entry_time or datetime.utcnow(),
             current_price=entry_price,
             strategy_name=strategy_name,
             signal_type=signal_type,
@@ -299,7 +300,8 @@ class PortfolioManager:
         return pos
 
     def close_position(
-        self, position_id: str, close_price: float
+        self, position_id: str, close_price: float,
+        close_time: Optional[datetime] = None,
     ) -> Optional[float]:
         """
         Close a position by ID. Returns realized P&L or None if not found.
@@ -327,7 +329,7 @@ class PortfolioManager:
             logger.warning(f"close_position: {position_id} already closed")
             return pos.realized_pnl
 
-        pnl = pos.close(close_price, datetime.utcnow())
+        pnl = pos.close(close_price, close_time or datetime.utcnow())
         # Closing transaction: reverse of open
         #   Long (qty>0): sell to close → receive close_price * qty * 100
         #   Short (qty<0): buy to close → pay close_price * |qty| * 100
@@ -416,10 +418,16 @@ class PortfolioManager:
     # EQUITY CURVE
     # ------------------------------------------------------------------
 
-    def snapshot(self, daily_pnl: float = 0.0) -> EquityPoint:
-        """Record current portfolio state to equity curve. Returns the point."""
+    def snapshot(self, daily_pnl: float = 0.0, timestamp: Optional[datetime] = None) -> EquityPoint:
+        """
+        Record current portfolio state to equity curve.
+
+        Pass `timestamp` from the simulation loop so the equity curve carries
+        the *simulation* date rather than wall-clock time.  This is required
+        for accurate year-by-year performance attribution.
+        """
         pt = EquityPoint(
-            timestamp=datetime.utcnow(),
+            timestamp=timestamp or datetime.utcnow(),
             portfolio_value=self.portfolio_value,
             daily_pnl=daily_pnl,
             realized_pnl=self.total_realized_pnl,

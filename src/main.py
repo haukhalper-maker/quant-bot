@@ -359,6 +359,71 @@ _VOL_REGIMES: Dict[str, dict] = {
         ],
     },
 
+    # ── 2019 ─────────────────────────────────────────────────────────────────
+    # SPY: ~247 → ~320  (+29%)
+    # VIX: ranged 12-16 all year, low realized vol environment
+    "2019": {
+        "label": "2019 Calm Bull (VIX 12-16, +29%)",
+        "initial_price": 247.0,
+        "annual_drift": 0.29,
+        "base_vol": 0.115,
+        "long_run_vol": 0.125,
+        "vol_of_vol": 0.0025,
+        "vol_mean_rev": 0.08,
+        "vol_jump_prob": 0.002,
+        "vol_jump_mean": 0.025,
+        "iv_premium": 1.08,
+        "iv_seed_mean": 0.135,
+        "iv_seed_std": 0.018,
+        "events": [],
+    },
+
+    # ── 2021 ─────────────────────────────────────────────────────────────────
+    # SPY: ~374 → ~474  (+27%)
+    # VIX: 15-25 with spikes; meme stock mania Jan (GME +1500%), then gamma squeeze
+    "2021": {
+        "label": "2021 Meme Stock Vol (VIX 15-25, +27%)",
+        "initial_price": 374.0,
+        "annual_drift": 0.27,
+        "base_vol": 0.155,
+        "long_run_vol": 0.165,
+        "vol_of_vol": 0.0045,
+        "vol_mean_rev": 0.06,
+        "vol_jump_prob": 0.008,     # more frequent spikes from meme/options flows
+        "vol_jump_mean": 0.04,
+        "iv_premium": 1.12,
+        "iv_seed_mean": 0.175,
+        "iv_seed_std": 0.028,
+        "events": [
+            # GME/meme mania: Jan 25-29 2021 → trading days 15-20
+            {"tday_start": 15, "tday_end": 22,
+             "vol_override": 0.32, "drift_override": -0.8, "iv_premium": 1.30},
+        ],
+    },
+
+    # ── 2023 ─────────────────────────────────────────────────────────────────
+    # SPY: ~380 → ~475  (+24%)
+    # VIX: 13-18 most of year; SVB banking crisis in March
+    "2023": {
+        "label": "2023 Recovery (VIX 13-18, SVB crisis Mar)",
+        "initial_price": 380.0,
+        "annual_drift": 0.24,
+        "base_vol": 0.128,
+        "long_run_vol": 0.135,
+        "vol_of_vol": 0.003,
+        "vol_mean_rev": 0.07,
+        "vol_jump_prob": 0.003,
+        "vol_jump_mean": 0.030,
+        "iv_premium": 1.10,
+        "iv_seed_mean": 0.155,
+        "iv_seed_std": 0.022,
+        "events": [
+            # SVB / regional banking contagion: Mar 8-17 → trading days ~43-52
+            {"tday_start": 43, "tday_end": 53,
+             "vol_override": 0.28, "drift_override": -1.8, "iv_premium": 1.28},
+        ],
+    },
+
     # ── 2022 ─────────────────────────────────────────────────────────────────
     # SPY: ~474 → ~380  (-19%)
     # VIX: sustained 25-35 all year, peaked ~39 in Jun/Oct
@@ -474,12 +539,18 @@ class BacktestRunner:
     def _detect_regime(start: datetime, end: datetime) -> str:
         """Map a date range to the closest historical vol regime."""
         sy, sm = start.year, start.month
-        if sy == 2024:
-            return "2024"
+        if sy == 2019:
+            return "2019"
+        if sy == 2020:
+            return "covid_2020"   # handles full year with 3-phase model
+        if sy == 2021:
+            return "2021"
         if sy == 2022:
             return "2022"
-        if sy == 2020 and sm <= 6:
-            return "covid_2020"
+        if sy == 2023:
+            return "2023"
+        if sy == 2024:
+            return "2024"
         return "generic"
 
     def _seed_regime_iv_history(self, regime: dict) -> None:
@@ -505,26 +576,148 @@ class BacktestRunner:
                 if hasattr(strategy, "seed_iv_history"):
                     strategy.seed_iv_history(sym, hist)
 
+    def _generate_multi_year_data(self) -> Dict[datetime, List[Candle]]:
+        """
+        Build market data for a multi-year span by concatenating per-year
+        regime data.  Price continuity is maintained by threading the last
+        closing price of each year into the next year's initial_price.
+        """
+        orig_start, orig_end = self.start_date, self.end_date
+        all_data: Dict[datetime, List[Candle]] = {}
+        last_prices: Dict[str, float] = {}
+
+        years = list(range(orig_start.year, orig_end.year + 1))
+        for year in years:
+            seg_start = max(orig_start, datetime(year, 1, 1))
+            seg_end   = min(orig_end,   datetime(year, 12, 31))
+
+            regime_key = self._detect_regime(seg_start, seg_end)
+            regime = dict(_VOL_REGIMES.get(regime_key, _VOL_REGIMES["generic"]))
+
+            # Price continuity: start next year from where last year ended
+            if last_prices:
+                for sym in self.config.symbols:
+                    if sym in last_prices:
+                        regime["initial_price"] = last_prices[sym]
+                        break
+
+            self.start_date = seg_start
+            self.end_date   = seg_end
+            seg_data = self._generate_market_data(regime)
+            all_data.update(seg_data)
+
+            # Record each symbol's ending price
+            if seg_data:
+                last_date = max(seg_data.keys())
+                for candle in seg_data[last_date]:
+                    last_prices[candle.symbol] = candle.close
+
+        self.start_date = orig_start
+        self.end_date   = orig_end
+        return all_data
+
+    def _compute_year_breakdown(self) -> Dict[int, dict]:
+        """
+        Slice the equity curve by calendar year and compute per-year stats.
+        Requires snapshot() to have been called with simulation timestamps.
+        """
+        equity = self.portfolio.equity_curve
+        if not equity:
+            return {}
+
+        years = sorted({pt.timestamp.year for pt in equity})
+        breakdown: Dict[int, dict] = {}
+
+        for year in years:
+            pts = [pt for pt in equity if pt.timestamp.year == year]
+            if not pts:
+                continue
+
+            start_val = pts[0].portfolio_value
+            end_val   = pts[-1].portfolio_value
+            year_return = (end_val - start_val) / start_val if start_val > 0 else 0.0
+
+            values = np.array([p.portfolio_value for p in pts])
+            daily_ret = np.diff(values) / values[:-1] if len(values) > 1 else np.array([0.0])
+            n = len(pts)
+            ann_return = (1 + year_return) ** (252 / max(n, 1)) - 1
+            ann_vol = float(np.std(daily_ret) * np.sqrt(252)) if len(daily_ret) > 1 else 0.01
+            sharpe = ann_return / ann_vol if ann_vol > 0 else 0.0
+
+            # Max drawdown within the year
+            peak = start_val
+            max_dd = 0.0
+            for v in values:
+                if v > peak:
+                    peak = v
+                dd = (peak - v) / peak if peak > 0 else 0.0
+                max_dd = max(max_dd, dd)
+
+            # Trades closed during this year
+            year_trades = [
+                pos for pos in self.portfolio.closed_positions
+                if pos.close_time and pos.close_time.year == year
+            ]
+            wins = sum(1 for t in year_trades if t.realized_pnl > 0)
+            trades = len(year_trades)
+            win_rate = wins / trades if trades > 0 else 0.0
+
+            regime_key = self._detect_regime(datetime(year, 1, 1), datetime(year, 12, 31))
+            regime_label = _VOL_REGIMES.get(regime_key, {}).get("label", regime_key)
+
+            breakdown[year] = {
+                "regime": regime_label,
+                "return": year_return,
+                "annualized_return": ann_return,
+                "sharpe": sharpe,
+                "max_drawdown": max_dd,
+                "trades": trades,
+                "win_rate": win_rate,
+                "start_value": start_val,
+                "end_value": end_val,
+            }
+
+        return breakdown
+
     async def run(self, start_date: str, end_date: str, regime_key: str = "auto") -> dict:
         self.start_date = datetime.strptime(start_date, "%Y-%m-%d")
         self.end_date   = datetime.strptime(end_date,   "%Y-%m-%d")
 
-        if regime_key == "auto":
-            regime_key = self._detect_regime(self.start_date, self.end_date)
-        regime = _VOL_REGIMES.get(regime_key, _VOL_REGIMES["generic"])
+        multi_year = (self.start_date.year != self.end_date.year and regime_key == "auto")
 
-        logger.info(
-            f"Backtest: {start_date} → {end_date} | "
-            f"regime={regime['label']} | LLM={'on' if self.reasoning_engine else 'off'}"
-        )
+        if multi_year:
+            regime_label = f"Multi-Year {self.start_date.year}-{self.end_date.year}"
+            logger.info(
+                f"Backtest: {start_date} → {end_date} | "
+                f"regime=multi-year ({self.start_date.year}–{self.end_date.year}) | "
+                f"LLM={'on' if self.reasoning_engine else 'off'}"
+            )
+        else:
+            if regime_key == "auto":
+                regime_key = self._detect_regime(self.start_date, self.end_date)
+            regime = _VOL_REGIMES.get(regime_key, _VOL_REGIMES["generic"])
+            regime_label = regime["label"]
+            logger.info(
+                f"Backtest: {start_date} → {end_date} | "
+                f"regime={regime_label} | LLM={'on' if self.reasoning_engine else 'off'}"
+            )
 
         try:
             await self.data_connector.connect()
-            self._seed_regime_iv_history(regime)
-            market_data = self._generate_market_data(regime)
+
+            if multi_year:
+                # Seed IV from the first year's regime
+                first_regime_key = self._detect_regime(self.start_date, self.start_date)
+                first_regime = _VOL_REGIMES.get(first_regime_key, _VOL_REGIMES["generic"])
+                self._seed_regime_iv_history(first_regime)
+                market_data = self._generate_multi_year_data()
+            else:
+                self._seed_regime_iv_history(regime)
+                market_data = self._generate_market_data(regime)
+
             await self._run_simulation(market_data)
             result = self._build_results()
-            result["regime"] = regime["label"]
+            result["regime"] = regime_label
             return result
         except Exception as e:
             logger.exception(f"Backtest failed: {e}")
@@ -625,7 +818,9 @@ class BacktestRunner:
             peak_value = max(peak_value, current_value)
             daily_pnl = current_value - self._prev_portfolio_value
             self._prev_portfolio_value = current_value
-            self.portfolio.snapshot(daily_pnl=daily_pnl)
+            # Pass simulation date so equity curve carries the right timestamp
+            # for year-by-year performance attribution
+            self.portfolio.snapshot(daily_pnl=daily_pnl, timestamp=current)
 
             current += timedelta(days=1)
 
@@ -671,7 +866,10 @@ class BacktestRunner:
                     else:
                         close_price = max(float(K * _n.cdf(-d2) - spot * _n.cdf(-d1)), 0.01)
 
-                pnl = self.portfolio.close_position(pos.position_id, close_price)
+                pnl = self.portfolio.close_position(
+                    pos.position_id, close_price,
+                    close_time=signal.timestamp,
+                )
                 if pnl is not None:
                     total_pnl += pnl
                     direction = "SHORT" if pos.quantity < 0 else "LONG"
@@ -709,6 +907,7 @@ class BacktestRunner:
                     strategy_name=signal.strategy_name,
                     signal_type=signal.signal_type.value,
                     llm_reasoning=signal.metadata.get("llm_reasoning", ""),
+                    entry_time=signal.timestamp,
                 )
                 filled = True
 
@@ -907,6 +1106,11 @@ class BacktestRunner:
                 "trading_days": metrics.trading_days,
             })
 
+        # Include year-by-year breakdown when running multi-year or report mode
+        equity_years = {pt.timestamp.year for pt in self.portfolio.equity_curve}
+        if len(equity_years) > 1:
+            result["year_by_year"] = self._compute_year_breakdown()
+
         return result
 
 
@@ -931,7 +1135,7 @@ def cli():
 @click.option(
     "--regime",
     default="auto",
-    type=click.Choice(["auto", "2024", "2022", "covid_2020", "generic"]),
+    type=click.Choice(["auto", "2019", "2021", "2022", "2023", "2024", "covid_2020", "generic"]),
     help="Vol regime (default: auto-detect from date range)",
 )
 @click.option("--no-hedge", is_flag=True, default=False,
@@ -966,7 +1170,7 @@ def backtest(start: str, end: str, symbols: str, capital: float, no_llm: bool,
     }
 
     for key, value in results.items():
-        if key in ("status", "regime"):
+        if key in ("status", "regime", "year_by_year"):
             continue
         label = key.replace("_", " ").title()
         if isinstance(value, float):
@@ -982,6 +1186,105 @@ def backtest(start: str, end: str, symbols: str, capital: float, no_llm: bool,
             click.echo(f"  {label:<35} {value}")
 
     click.echo("=" * 72)
+
+
+@cli.command()
+@click.option("--start",   default="2019-01-01", help="Start date (YYYY-MM-DD)")
+@click.option("--end",     default="2024-12-31", help="End date (YYYY-MM-DD)")
+@click.option("--symbols", default="SPY",         help="Comma-separated symbols")
+@click.option("--no-llm",  is_flag=True, default=False, help="Disable LLM validation")
+@click.option("--no-hedge", is_flag=True, default=False, help="Disable tail hedge")
+def report(start: str, end: str, symbols: str, no_llm: bool, no_hedge: bool):
+    """
+    Full performance report over a multi-year backtest.
+
+    Shows equity curve stats, year-by-year breakdown (return, Sharpe, max DD,
+    win rate), and aggregate metrics.  Default range: 2019-01-01 to 2024-12-31.
+
+    Example:
+      python -m src.main report --start 2019-01-01 --end 2024-12-31
+    """
+    config = BotConfig(
+        backtesting_mode=True,
+        paper_trading=True,
+        symbols=symbols.split(","),
+        llm_enabled=not no_llm,
+    )
+    runner = BacktestRunner(config, MockDataConnector(), enable_hedge=not no_hedge)
+    results = asyncio.run(runner.run(start, end))
+
+    hedge_label = "hedged" if not no_hedge else "unhedged"
+    w = 76
+
+    click.echo("\n" + "=" * w)
+    click.echo(f"  PERFORMANCE REPORT  [{start} to {end}]  [{hedge_label}]")
+    click.echo("=" * w)
+
+    # ── Year-by-year table ────────────────────────────────────────────────────
+    yby = results.get("year_by_year", {})
+    if yby:
+        click.echo("\n  YEAR-BY-YEAR BREAKDOWN")
+        click.echo("  " + "-" * (w - 2))
+        header = f"  {'Year':<6} {'Regime':<38} {'Return':>7} {'Sharpe':>7} {'MaxDD':>6} {'Trd':>4} {'Win%':>5}"
+        click.echo(header)
+        click.echo("  " + "-" * (w - 2))
+        total_trades = 0
+        for year in sorted(yby.keys()):
+            y = yby[year]
+            regime_short = y["regime"][:37]
+            total_trades += y["trades"]
+            click.echo(
+                f"  {year:<6} {regime_short:<38} "
+                f"{y['return']:>+7.2%} {y['sharpe']:>7.2f} "
+                f"{y['max_drawdown']:>6.2%} {y['trades']:>4} {y['win_rate']:>5.0%}"
+            )
+        click.echo("  " + "-" * (w - 2))
+        overall_return = results.get("total_return", 0.0)
+        overall_sharpe = results.get("sharpe_ratio", 0.0)
+        overall_dd     = results.get("max_drawdown", 0.0)
+        overall_wr     = results.get("win_rate", 0.0)
+        click.echo(
+            f"  {'TOTAL':<6} {f'{start[:4]}-{end[:4]} Combined':<38} "
+            f"{overall_return:>+7.2%} {overall_sharpe:>7.2f} "
+            f"{overall_dd:>6.2%} {total_trades:>4} {overall_wr:>5.0%}"
+        )
+        click.echo("  " + "-" * (w - 2))
+
+    # ── Overall statistics ────────────────────────────────────────────────────
+    click.echo("\n  OVERALL STATISTICS")
+    click.echo("  " + "-" * (w - 2))
+
+    stats = [
+        ("Starting Capital",        results.get("initial_capital"),  "dollar"),
+        ("Final Value",              results.get("final_value"),       "dollar"),
+        ("Total Return",             results.get("total_return"),      "pct"),
+        ("Annualized Return",        results.get("annualized_return"), "pct"),
+        ("Annualized Volatility",    results.get("annualized_volatility"), "pct"),
+        ("Max Drawdown",             results.get("max_drawdown"),      "pct"),
+        ("Max DD Duration (days)",   results.get("max_drawdown_duration_days"), "int"),
+        ("Sharpe Ratio",             results.get("sharpe_ratio"),      "ratio"),
+        ("Sortino Ratio",            results.get("sortino_ratio"),     "ratio"),
+        ("Calmar Ratio",             results.get("calmar_ratio"),      "ratio"),
+        ("Win Rate",                 results.get("win_rate"),          "pct"),
+        ("Profit Factor",            results.get("profit_factor"),     "ratio"),
+        ("Avg Win",                  results.get("avg_win"),           "dollar"),
+        ("Avg Loss",                 results.get("avg_loss"),          "dollar"),
+        ("Total Trades",             results.get("total_trades"),      "int"),
+        ("Trading Days",             results.get("trading_days"),      "int"),
+    ]
+    for label, value, fmt in stats:
+        if value is None:
+            continue
+        if fmt == "dollar":
+            click.echo(f"  {label:<35} ${value:>12,.2f}")
+        elif fmt == "pct":
+            click.echo(f"  {label:<35} {value:>12.2%}")
+        elif fmt == "ratio":
+            click.echo(f"  {label:<35} {value:>12.4f}")
+        elif fmt == "int":
+            click.echo(f"  {label:<35} {int(value):>12,}")
+
+    click.echo("=" * w + "\n")
 
 
 @cli.command()
