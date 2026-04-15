@@ -368,10 +368,26 @@ def signal_to_orders(signal, mid_price: float) -> List[Order]:
         ))
 
     elif signal.signal_type == SignalType.BUY_PUT:
+        # Use BSM price from metadata when available (e.g. TailHedgeStrategy).
+        # Fallback: compute from implied_vol in metadata; last resort: mid_price.
+        price_override = signal.metadata.get("put_price")
+        if price_override and price_override > 0:
+            leg_price = float(price_override)
+        else:
+            iv = signal.metadata.get("implied_vol")
+            if iv:
+                try:
+                    exp_dt = datetime.strptime(signal.expiry, "%Y-%m-%d")
+                    T = max((exp_dt - signal.timestamp.replace(tzinfo=None)).days, 1) / 365.0
+                except Exception:
+                    T = 28 / 365.0
+                leg_price = max(_bsm_put(mid_price, signal.strike, float(iv), T), 0.01)
+            else:
+                leg_price = mid_price
         orders.append(Order(
             order_id="", option_type="PUT", strike=signal.strike,
             side=OrderSide.BUY, quantity=signal.position_size,
-            price=mid_price, **common,
+            price=leg_price, **common,
         ))
 
     elif signal.signal_type == SignalType.SELL_CALL:

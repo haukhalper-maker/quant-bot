@@ -27,6 +27,7 @@ from src.strategy import (
     VolatilityMeanReversionStrategy,
     GammaScalpingStrategy,
     GammaImbalanceTrader,
+    TailHedgeStrategy,
     RuleEngine,
     Signal,
     SignalType,
@@ -429,10 +430,11 @@ class BacktestRunner:
     realistic execution, and portfolio P&L tracking.
     """
 
-    def __init__(self, config: BotConfig, data_connector=None):
+    def __init__(self, config: BotConfig, data_connector=None, enable_hedge: bool = True):
         self.config = config
         self.data_connector = data_connector or MockDataConnector()
         self.analysis = AnalysisEngine()
+        self.enable_hedge = enable_hedge
 
         # LLM (optional in backtest — useful for validating LLM logic offline)
         self.reasoning_engine: Optional[TradeReasoningEngine] = None
@@ -447,6 +449,8 @@ class BacktestRunner:
 
         self.rule_engine = RuleEngine(reasoning_engine=self.reasoning_engine)
         self.rule_engine.register_strategy(VolatilityMeanReversionStrategy())
+        if enable_hedge:
+            self.rule_engine.register_strategy(TailHedgeStrategy())
 
         self.executor = PaperTradingExecutor(
             commission_per_contract=0.65,
@@ -564,6 +568,8 @@ class BacktestRunner:
 
     async def _run_simulation(self, market_data: Dict[datetime, List[Candle]]) -> None:
         current = self.start_date
+        peak_value: float = self.portfolio.portfolio_value   # high-water mark for hedge
+
         while current <= self.end_date:
             if current.weekday() >= 5:  # Skip weekends
                 current += timedelta(days=1)
@@ -578,6 +584,16 @@ class BacktestRunner:
 
                 # Mark open positions at BSM theoretical value (not underlying price)
                 self._bsm_mark_portfolio(candle.close, candle.implied_vol or 0.20, current)
+
+                # Feed current drawdown state into TailHedgeStrategy before signals
+                current_portfolio_value = self.portfolio.portfolio_value
+                for strategy in self.rule_engine.strategies:
+                    if hasattr(strategy, "update_portfolio_state"):
+                        strategy.update_portfolio_state(
+                            current_value=current_portfolio_value,
+                            peak_value=peak_value,
+                            capital=100_000.0,
+                        )
 
                 # Collect strategy signals; sync IV estimates into analysis engine
                 signals = []
@@ -604,8 +620,9 @@ class BacktestRunner:
                     for signal in approved:
                         await self._execute_signal(signal, candle.close)
 
-            # EOD: snapshot portfolio
+            # EOD: snapshot portfolio and advance high-water mark
             current_value = self.portfolio.portfolio_value
+            peak_value = max(peak_value, current_value)
             daily_pnl = current_value - self._prev_portfolio_value
             self._prev_portfolio_value = current_value
             self.portfolio.snapshot(daily_pnl=daily_pnl)
@@ -631,7 +648,12 @@ class BacktestRunner:
             T_close     = max(dte, 0) / 365.0
             spot        = signal.strike    # strategy sets signal.strike = candle.close
 
-            positions   = self.portfolio.positions_for_symbol(signal.symbol)
+            positions = self.portfolio.positions_for_symbol(signal.symbol)
+            # If the signal targets a specific strategy's positions (e.g. TailHedge
+            # closing only its own puts, not the condor legs), filter by strategy_name.
+            close_strategy = signal.metadata.get("close_strategy_name")
+            if close_strategy:
+                positions = [p for p in positions if p.strategy_name == close_strategy]
             total_pnl   = 0.0
 
             for pos in positions:
@@ -912,8 +934,10 @@ def cli():
     type=click.Choice(["auto", "2024", "2022", "covid_2020", "generic"]),
     help="Vol regime (default: auto-detect from date range)",
 )
+@click.option("--no-hedge", is_flag=True, default=False,
+              help="Disable the dynamic drawdown tail hedge")
 def backtest(start: str, end: str, symbols: str, capital: float, no_llm: bool,
-             data_source: str, regime: str):
+             data_source: str, regime: str, no_hedge: bool):
     """Run historical backtest with historically-calibrated vol regimes."""
     config = BotConfig(
         backtesting_mode=True,
@@ -922,11 +946,12 @@ def backtest(start: str, end: str, symbols: str, capital: float, no_llm: bool,
         llm_enabled=not no_llm,
     )
     connector = TastytradeConnector() if data_source == "tastytrade" else MockDataConnector()
-    runner = BacktestRunner(config, connector)
+    runner = BacktestRunner(config, connector, enable_hedge=not no_hedge)
     results = asyncio.run(runner.run(start, end, regime_key=regime))
 
+    hedge_label = "hedged" if not no_hedge else "unhedged"
     click.echo("\n" + "=" * 72)
-    click.echo(f"  BACKTEST RESULTS  [{results.get('regime', 'unknown regime')}]")
+    click.echo(f"  BACKTEST RESULTS  [{results.get('regime', 'unknown regime')}]  [{hedge_label}]")
     click.echo("=" * 72)
 
     fmt_fields = {

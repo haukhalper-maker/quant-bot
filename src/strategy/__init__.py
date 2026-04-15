@@ -904,6 +904,202 @@ class GammaImbalanceTrader(Strategy):
 
 
 # ============================================================================
+# TAIL HEDGE STRATEGY
+# ============================================================================
+
+
+class TailHedgeStrategy(Strategy):
+    """
+    Dynamic drawdown-triggered tail hedge.
+
+    Monitors portfolio equity vs its high-water mark.  When drawdown exceeds
+    `trigger_pct`, buys OTM puts sized to cover `target_cover_pct` of the open
+    loss via delta-adjusted notional.  Spend is capped at `max_hedge_cost_pct`
+    of starting capital per activation.
+
+    The hedge is closed when drawdown recovers below `close_pct`.
+
+    IMPORTANT: update_portfolio_state() must be called each candle by the
+    simulation loop / bot before on_candle() is processed.
+
+    How it interacts with iron condors:
+      - Condor is short vol — loses when spot moves or IV spikes.
+      - OTM put gains intrinsic value when spot drops and vega when IV spikes.
+      - The combination caps the left-tail loss of the condor book.
+      - Net cost: put premium (~1-2% of capital at 2% DD trigger).
+    """
+
+    def __init__(
+        self,
+        trigger_pct: float = 0.02,        # buy puts when DD > 2%
+        close_pct: float = 0.005,          # close hedge when DD < 0.5%
+        otm_pct: float = 0.05,             # buy 5% OTM puts
+        dte_weeks: int = 4,                # ~30 DTE
+        target_cover_pct: float = 0.50,    # hedge 50% of open loss via delta
+        max_hedge_cost_pct: float = 0.015, # cap spend at 1.5% of capital per activation
+    ):
+        super().__init__("TailHedge")
+        self.trigger_pct = trigger_pct
+        self.close_pct = close_pct
+        self.otm_pct = otm_pct
+        self.dte_weeks = dte_weeks
+        self.target_cover_pct = target_cover_pct
+        self.max_hedge_cost_pct = max_hedge_cost_pct
+
+        # State injected by simulation loop before each candle
+        self._portfolio_value: float = 0.0
+        self._peak_value: float = 0.0
+        self._capital: float = 100_000.0
+
+        # Per-symbol hedge tracking
+        self._hedged: Dict[str, bool] = {}
+        self._hedge_entry: Dict[str, Dict] = {}  # symbol → {expiry, strike, contracts}
+
+    def update_portfolio_state(
+        self,
+        current_value: float,
+        peak_value: float,
+        capital: float,
+    ) -> None:
+        """Must be called each candle by the simulation loop before on_candle()."""
+        self._portfolio_value = current_value
+        self._peak_value = peak_value
+        self._capital = capital
+
+    async def on_tick(self, tick) -> Optional[Signal]:
+        return None
+
+    async def on_greek_update(self, greeks) -> Optional[Signal]:
+        return None
+
+    @staticmethod
+    def _bsm_put(S: float, K: float, sigma: float, T: float) -> float:
+        if T <= 1e-6:
+            return max(K - S, 0.0)
+        sq = sigma * T ** 0.5
+        d1 = (np.log(S / K) + 0.5 * sigma ** 2 * T) / sq
+        return float(K * _norm.cdf(sq - d1) - S * _norm.cdf(-d1))
+
+    @staticmethod
+    def _put_delta(S: float, K: float, sigma: float, T: float) -> float:
+        """BSM put delta (negative value)."""
+        if T <= 1e-6:
+            return -1.0 if K > S else 0.0
+        sq = sigma * T ** 0.5
+        d1 = (np.log(S / K) + 0.5 * sigma ** 2 * T) / sq
+        return float(_norm.cdf(d1) - 1.0)
+
+    def _next_expiry(self, weeks_out: int, ref_date=None) -> str:
+        from datetime import date as _date
+        today = ref_date or _date.today()
+        days_to_friday = (4 - today.weekday()) % 7
+        if days_to_friday == 0:
+            days_to_friday = 7
+        expiry = today + timedelta(days=days_to_friday + weeks_out * 7)
+        return expiry.strftime("%Y-%m-%d")
+
+    async def on_candle(self, candle) -> Optional[Signal]:
+        sym = candle.symbol
+        S = candle.close
+        now = candle.timestamp
+        iv = max(getattr(candle, "implied_vol", None) or 0.20, 0.05)
+
+        peak = self._peak_value if self._peak_value > 0 else self._capital
+        current = self._portfolio_value if self._portfolio_value > 0 else peak
+        drawdown = max((peak - current) / peak, 0.0)
+        loss_dollars = max(peak - current, 0.0)
+
+        has_hedge = self._hedged.get(sym, False)
+
+        # ── Close hedge when portfolio recovers ──────────────────────────────
+        if has_hedge and drawdown <= self.close_pct:
+            self._hedged[sym] = False
+            entry_info = self._hedge_entry.pop(sym, {})
+            expiry = entry_info.get("expiry", self._next_expiry(self.dte_weeks, now.date()))
+
+            logger.info(
+                f"[{self.name}] Closing hedge on {sym}: DD recovered to {drawdown:.2%}"
+            )
+            return self._emit(Signal(
+                signal_type=SignalType.CLOSE_POSITION,
+                symbol=sym,
+                timestamp=now,
+                strike=S,
+                expiry=expiry,
+                confidence=0.95,
+                position_size=1,
+                strategy_name=self.name,
+                metadata={
+                    "reason": "hedge_dd_recovered",
+                    "drawdown": drawdown,
+                    "current_iv": iv,
+                    "dte": 0,
+                    "signal_type": "tail_hedge_put",
+                    "close_strategy_name": self.name,   # only close OUR positions
+                },
+            ))
+
+        # ── Activate hedge when drawdown breaches trigger ────────────────────
+        if not has_hedge and drawdown >= self.trigger_pct:
+            K = S * (1.0 - self.otm_pct)
+            T = (self.dte_weeks * 7) / 365.0
+            put_price = max(self._bsm_put(S, K, iv, T), 0.05)
+
+            # Size: cover target_cover_pct of loss via delta-adjusted notional
+            put_delta_abs = abs(self._put_delta(S, K, iv, T))
+            if put_delta_abs > 1e-4:
+                # Each contract gains put_delta_abs * 100 per $1 move in spot
+                # We want to cover `loss * target_cover_pct` of dollar-delta exposure
+                contracts = max(1, int(
+                    (loss_dollars * self.target_cover_pct)
+                    / (put_delta_abs * 100 * S)
+                ))
+            else:
+                contracts = 1
+
+            # Cap total premium spend
+            cost = put_price * contracts * 100
+            max_cost = self._capital * self.max_hedge_cost_pct
+            if cost > max_cost:
+                contracts = max(1, int(max_cost / (put_price * 100)))
+                cost = put_price * contracts * 100
+
+            expiry = self._next_expiry(self.dte_weeks, now.date())
+            self._hedged[sym] = True
+            self._hedge_entry[sym] = {
+                "expiry": expiry,
+                "strike": K,
+                "contracts": contracts,
+                "entry_price": put_price,
+            }
+
+            logger.info(
+                f"[{self.name}] HEDGE ACTIVATED {sym}: DD={drawdown:.2%} "
+                f"loss=${loss_dollars:.0f} → {contracts}x put K={K:.1f} "
+                f"iv={iv:.1%} cost=${cost:.0f}"
+            )
+            return self._emit(Signal(
+                signal_type=SignalType.BUY_PUT,
+                symbol=sym,
+                timestamp=now,
+                strike=K,
+                expiry=expiry,
+                confidence=0.92,
+                position_size=contracts,
+                strategy_name=self.name,
+                metadata={
+                    "implied_vol": iv,
+                    "put_price": put_price,
+                    "reason": "tail_hedge_dd_trigger",
+                    "drawdown": drawdown,
+                    "loss_dollars": loss_dollars,
+                },
+            ))
+
+        return None
+
+
+# ============================================================================
 # RULE ENGINE (with LLM integration)
 # ============================================================================
 
