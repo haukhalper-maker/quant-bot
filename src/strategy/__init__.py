@@ -133,9 +133,12 @@ class VolatilityMeanReversionStrategy(Strategy):
       - IV/RV filter: only buy if IV/RV < 1.2; only sell if IV/RV > 1.4
       - Confidence scales linearly with distance from threshold
 
-    Exit rules:
-      - Close long vol when IV%ile > 65 or days_held >= max_hold_days
-      - Close short vol when IV%ile < 35 or days_held >= max_hold_days
+    Exit rules (checked every candle, no cooldown):
+      1. 50% of max profit reached (short: premium decayed 50%; long: premium up 50%)
+      2. Stop loss at 200% of premium collected/paid
+      3. 21 DTE — close before gamma risk explodes near expiry
+      4. IV mean reversion complete (IV%ile crossed back to neutral)
+      5. max_hold_days exceeded
     """
 
     def __init__(
@@ -145,9 +148,12 @@ class VolatilityMeanReversionStrategy(Strategy):
         sell_threshold: float = 75.0,
         min_confidence: float = 0.45,
         min_signal_interval_hours: float = 4.0,
-        max_hold_days: int = 21,
+        max_hold_days: int = 45,
         iv_rv_buy_max: float = 1.2,
         iv_rv_sell_min: float = 1.4,
+        take_profit_pct: float = 0.50,   # close short at 50% of max profit
+        stop_loss_mult: float = 2.00,    # stop loss at 200% of premium collected
+        dte_close: int = 21,             # close when DTE reaches this level
     ):
         super().__init__("VolMeanReversion")
         self.lookback_days = lookback_days
@@ -158,11 +164,16 @@ class VolatilityMeanReversionStrategy(Strategy):
         self.max_hold_days = max_hold_days
         self.iv_rv_buy_max = iv_rv_buy_max
         self.iv_rv_sell_min = iv_rv_sell_min
+        self.take_profit_pct = take_profit_pct
+        self.stop_loss_mult = stop_loss_mult
+        self.dte_close = dte_close
 
         self._price_history: Dict[str, List[float]] = {}
         self._iv_history: Dict[str, List[float]] = {}
-        self._positions: Dict[str, Dict] = {}       # symbol → {type, entry_time}
-        self._last_signal: Dict[str, datetime] = {} # symbol → last signal time
+        # symbol → {type, entry_time, entry_premium, expiry, entry_iv_pct, confirmed}
+        # 'confirmed' is False until BacktestRunner/Bot calls confirm_entry() after fill.
+        self._positions: Dict[str, Dict] = {}
+        self._last_signal: Dict[str, datetime] = {} # symbol → last entry signal time
 
     async def on_tick(self, tick) -> Optional[Signal]:
         sym = tick.symbol
@@ -236,15 +247,15 @@ class VolatilityMeanReversionStrategy(Strategy):
             return 50.0
         return float(sum(1 for v in hist if current_iv >= v) / len(hist) * 100)
 
-    def _can_signal(self, symbol: str) -> bool:
+    def _can_signal(self, symbol: str, now: datetime) -> bool:
         last = self._last_signal.get(symbol)
         if last is None:
             return True
-        return datetime.utcnow() - last >= self.min_signal_interval
+        return now - last >= self.min_signal_interval
 
-    def _next_expiry(self, weeks_out: int = 4) -> str:
-        """Return the next options expiry (weekly, ~N weeks out)."""
-        today = datetime.utcnow().date()
+    def _next_expiry(self, weeks_out: int = 4, ref_date=None) -> str:
+        """Return the next options expiry (weekly, ~N weeks out) from ref_date."""
+        today = ref_date or datetime.utcnow().date()
         # Roll to next Friday
         days_to_friday = (4 - today.weekday()) % 7
         if days_to_friday == 0:
@@ -252,78 +263,101 @@ class VolatilityMeanReversionStrategy(Strategy):
         expiry = today + timedelta(days=days_to_friday + weeks_out * 7)
         return expiry.strftime("%Y-%m-%d")
 
+    def confirm_entry(self, symbol: str) -> None:
+        """
+        Called by the execution layer after a fill is confirmed.
+        Activates exit-rule monitoring for this position.
+        """
+        pos = self._positions.get(symbol)
+        if pos and not pos.get("confirmed", False):
+            pos["confirmed"] = True
+            logger.info(f"[{self.name}] Entry confirmed for {symbol} — exit monitoring active")
+
+    def on_signal_rejected(self, symbol: str) -> None:
+        """
+        Called when an entry signal was rejected (LLM or rule filter).
+        Clears the pending position so we don't exit a trade that was never opened.
+        """
+        pos = self._positions.get(symbol)
+        if pos and not pos.get("confirmed", False):
+            del self._positions[symbol]
+            logger.debug(f"[{self.name}] Rolled back unconfirmed entry for {symbol}")
+
+    @staticmethod
+    def _atm_premium(spot: float, iv: float, dte: float) -> float:
+        """
+        Bachelier ATM approximation: premium ≈ 0.4 * S * IV * sqrt(T).
+        T = DTE / 365 (calendar-day basis).
+        """
+        t = max(dte, 1) / 365.0
+        return 0.40 * spot * iv * (t ** 0.5)
+
+    @staticmethod
+    def _dte(expiry_str: str, ref: datetime) -> float:
+        """Calendar days from ref to expiry."""
+        try:
+            exp = datetime.strptime(expiry_str, "%Y-%m-%d")
+            return max(0.0, (exp - ref).days)
+        except (ValueError, TypeError):
+            return 30.0  # fallback if expiry is missing/malformed
+
     async def _evaluate(
         self, sym: str, iv_pct: float, realized_vol: float,
         implied_vol: float, iv_rv: float, candle
     ) -> Optional[Signal]:
-        if not self._can_signal(sym):
-            return None
-
+        # Use candle timestamp so backtest timing is correct (not wall-clock time)
+        now: datetime = candle.timestamp
         pos = self._positions.get(sym, {})
-        now = datetime.utcnow()
 
-        # --- BUY vol: IV is cheap ---
-        if iv_pct < self.buy_threshold and iv_rv < self.iv_rv_buy_max and pos.get("type") != "long":
-            conf = (self.buy_threshold - iv_pct) / self.buy_threshold
-            if conf < self.min_confidence:
-                return None
-            self._last_signal[sym] = now
-            self._positions[sym] = {"type": "long", "entry_time": now, "entry_iv_pct": iv_pct}
-            return self._emit(Signal(
-                signal_type=SignalType.STRADDLE,
-                symbol=sym,
-                timestamp=now,
-                strike=candle.close,
-                expiry=self._next_expiry(weeks_out=4),
-                confidence=min(conf, 1.0),
-                position_size=1,
-                strategy_name=self.name,
-                metadata={
-                    "iv_percentile": iv_pct,
-                    "iv_rv_ratio": iv_rv,
-                    "realized_vol": realized_vol,
-                    "implied_vol": implied_vol,
-                    "reason": "buy_cheap_vol",
-                },
-            ))
+        # ------------------------------------------------------------------ #
+        # EXIT LOGIC — checked every candle, no cooldown gate                 #
+        # Only runs after confirm_entry() has been called (real fill received) #
+        # ------------------------------------------------------------------ #
+        if pos and pos.get("confirmed", False):
+            entry_time: datetime = pos["entry_time"]
+            pos_type: str = pos["type"]
+            entry_premium: float = pos.get("entry_premium", 0.0)
+            expiry_str: str = pos.get("expiry", "")
 
-        # --- SELL vol: IV is rich ---
-        if iv_pct > self.sell_threshold and iv_rv > self.iv_rv_sell_min and pos.get("type") != "short":
-            conf = (iv_pct - self.sell_threshold) / (100 - self.sell_threshold)
-            if conf < self.min_confidence:
-                return None
-            self._last_signal[sym] = now
-            self._positions[sym] = {"type": "short", "entry_time": now, "entry_iv_pct": iv_pct}
-            return self._emit(Signal(
-                signal_type=SignalType.IRON_CONDOR,
-                symbol=sym,
-                timestamp=now,
-                strike=candle.close,
-                expiry=self._next_expiry(weeks_out=6),
-                confidence=min(conf, 1.0),
-                position_size=1,
-                strategy_name=self.name,
-                metadata={
-                    "iv_percentile": iv_pct,
-                    "iv_rv_ratio": iv_rv,
-                    "realized_vol": realized_vol,
-                    "implied_vol": implied_vol,
-                    "reason": "sell_rich_vol",
-                },
-            ))
-
-        # --- EXIT: position has mean reverted ---
-        if pos:
-            entry_time = pos.get("entry_time", now)
             days_held = (now - entry_time).days
-            pos_type = pos.get("type")
+            dte = self._dte(expiry_str, now)
+            current_premium = self._atm_premium(candle.close, implied_vol, dte)
 
-            should_close = (
-                (pos_type == "long" and (iv_pct > 65 or days_held >= self.max_hold_days))
-                or (pos_type == "short" and (iv_pct < 35 or days_held >= self.max_hold_days))
-            )
-            if should_close:
-                reason = "mean_reversion_complete" if days_held < self.max_hold_days else "max_hold_exceeded"
+            exit_reason: Optional[str] = None
+
+            # Rule 1 — 21 DTE management: close before pin/gamma risk explodes
+            if dte <= self.dte_close:
+                exit_reason = f"dte_{int(dte)}_management"
+
+            # Rule 2 — 50% of max profit (short: premium decayed; long: premium grew)
+            elif entry_premium > 0 and pos_type == "short":
+                profit_pct = (entry_premium - current_premium) / entry_premium
+                if profit_pct >= self.take_profit_pct:
+                    exit_reason = "take_profit_50pct"
+                # Rule 3 — stop loss at 200% of premium collected
+                elif current_premium >= self.stop_loss_mult * entry_premium:
+                    exit_reason = "stop_loss_200pct"
+
+            elif entry_premium > 0 and pos_type == "long":
+                profit_pct = (current_premium - entry_premium) / entry_premium
+                if profit_pct >= self.take_profit_pct:
+                    exit_reason = "take_profit_50pct"
+                # Stop long at 200% of premium paid (lost 2x what we put in)
+                elif current_premium <= entry_premium / self.stop_loss_mult:
+                    exit_reason = "stop_loss_200pct"
+
+            # Rule 4 — IV mean reversion complete
+            elif (
+                (pos_type == "long" and iv_pct > 65)
+                or (pos_type == "short" and iv_pct < 35)
+            ):
+                exit_reason = "mean_reversion_complete"
+
+            # Rule 5 — max hold days exceeded
+            elif days_held >= self.max_hold_days:
+                exit_reason = "max_hold_exceeded"
+
+            if exit_reason:
                 self._positions[sym] = {}
                 self._last_signal[sym] = now
                 return self._emit(Signal(
@@ -331,12 +365,95 @@ class VolatilityMeanReversionStrategy(Strategy):
                     symbol=sym,
                     timestamp=now,
                     strike=candle.close,
-                    expiry=self._next_expiry(),
-                    confidence=0.85,
+                    expiry=expiry_str or self._next_expiry(ref_date=now.date()),
+                    confidence=0.90,
                     position_size=1,
                     strategy_name=self.name,
-                    metadata={"iv_percentile": iv_pct, "days_held": days_held, "reason": reason},
+                    metadata={
+                        "iv_percentile": iv_pct,
+                        "days_held": days_held,
+                        "dte": dte,
+                        "entry_premium": entry_premium,
+                        "current_premium": current_premium,
+                        "reason": exit_reason,
+                    },
                 ))
+
+        # ------------------------------------------------------------------ #
+        # ENTRY LOGIC — gated by signal cooldown                              #
+        # ------------------------------------------------------------------ #
+        if not self._can_signal(sym, now):
+            return None
+
+        # --- BUY vol: IV is cheap ---
+        if iv_pct < self.buy_threshold and iv_rv < self.iv_rv_buy_max and not pos and not self._positions.get(sym):
+            conf = (self.buy_threshold - iv_pct) / self.buy_threshold
+            if conf < self.min_confidence:
+                return None
+            expiry = self._next_expiry(weeks_out=4, ref_date=now.date())
+            entry_premium = self._atm_premium(candle.close, implied_vol, 4 * 7)
+            self._last_signal[sym] = now
+            self._positions[sym] = {
+                "type": "long",
+                "entry_time": now,
+                "entry_iv_pct": iv_pct,
+                "entry_premium": entry_premium,
+                "expiry": expiry,
+                "confirmed": False,
+            }
+            return self._emit(Signal(
+                signal_type=SignalType.STRADDLE,
+                symbol=sym,
+                timestamp=now,
+                strike=candle.close,
+                expiry=expiry,
+                confidence=min(conf, 1.0),
+                position_size=1,
+                strategy_name=self.name,
+                metadata={
+                    "iv_percentile": iv_pct,
+                    "iv_rv_ratio": iv_rv,
+                    "realized_vol": realized_vol,
+                    "implied_vol": implied_vol,
+                    "entry_premium": entry_premium,
+                    "reason": "buy_cheap_vol",
+                },
+            ))
+
+        # --- SELL vol: IV is rich ---
+        if iv_pct > self.sell_threshold and iv_rv > self.iv_rv_sell_min and not pos and not self._positions.get(sym):
+            conf = (iv_pct - self.sell_threshold) / (100 - self.sell_threshold)
+            if conf < self.min_confidence:
+                return None
+            expiry = self._next_expiry(weeks_out=6, ref_date=now.date())
+            entry_premium = self._atm_premium(candle.close, implied_vol, 6 * 7)
+            self._last_signal[sym] = now
+            self._positions[sym] = {
+                "type": "short",
+                "entry_time": now,
+                "entry_iv_pct": iv_pct,
+                "entry_premium": entry_premium,
+                "expiry": expiry,
+                "confirmed": False,
+            }
+            return self._emit(Signal(
+                signal_type=SignalType.IRON_CONDOR,
+                symbol=sym,
+                timestamp=now,
+                strike=candle.close,
+                expiry=expiry,
+                confidence=min(conf, 1.0),
+                position_size=1,
+                strategy_name=self.name,
+                metadata={
+                    "iv_percentile": iv_pct,
+                    "iv_rv_ratio": iv_rv,
+                    "realized_vol": realized_vol,
+                    "implied_vol": implied_vol,
+                    "entry_premium": entry_premium,
+                    "reason": "sell_rich_vol",
+                },
+            ))
 
         return None
 

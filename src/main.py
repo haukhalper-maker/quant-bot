@@ -351,12 +351,15 @@ class BacktestRunner:
                 # Mark open positions
                 self.portfolio.mark_all({candle.symbol: candle.close})
 
-                # Collect strategy signals
+                # Collect strategy signals; sync IV estimates into analysis engine
                 signals = []
                 for strategy in self.rule_engine.strategies:
                     sig = await strategy.on_candle(candle)
                     if sig:
                         signals.append(sig)
+                        iv = sig.metadata.get("implied_vol")
+                        if iv:
+                            self.analysis.on_iv(sig.symbol, iv)
 
                 if signals and not self.circuit_breaker.is_tripped:
                     approved = await self.rule_engine.evaluate_signals(
@@ -364,6 +367,12 @@ class BacktestRunner:
                         portfolio=self.portfolio,
                         analysis_engine=self.analysis,
                     )
+                    approved_syms = {s.symbol for s in approved}
+                    for sig in signals:
+                        if sig.signal_type != SignalType.CLOSE_POSITION and sig.symbol not in approved_syms:
+                            for strategy in self.rule_engine.strategies:
+                                if hasattr(strategy, "on_signal_rejected"):
+                                    strategy.on_signal_rejected(sig.symbol)
                     for signal in approved:
                         await self._execute_signal(signal, candle.close)
 
@@ -384,6 +393,7 @@ class BacktestRunner:
             return
 
         orders = signal_to_orders(signal, mid_price)
+        filled = False
         for order in orders:
             order_id = await self.executor.place_order(order)
             order = self.executor.orders[order_id]
@@ -400,6 +410,13 @@ class BacktestRunner:
                     signal_type=signal.signal_type.value,
                     llm_reasoning=signal.metadata.get("llm_reasoning", ""),
                 )
+                filled = True
+
+        # Notify strategy that the entry was actually filled so exit monitoring activates
+        if filled:
+            for strategy in self.rule_engine.strategies:
+                if hasattr(strategy, "confirm_entry"):
+                    strategy.confirm_entry(signal.symbol)
 
     def _generate_market_data(self) -> Dict[datetime, List[Candle]]:
         """

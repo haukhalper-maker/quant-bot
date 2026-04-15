@@ -7,7 +7,8 @@
       "Bash(python -m src llm-check)",
       "Bash(python -c \"from src.main import cli; cli\\(\\)\" -- llm-check)",
       "Bash(python src/main.py llm-check)",
-      "Bash(set PYTHONIOENCODING=utf-8)"
+      "Bash(set PYTHONIOENCODING=utf-8)",
+      "Bash(python test_backtest.py)"
     ]
   }
 }
