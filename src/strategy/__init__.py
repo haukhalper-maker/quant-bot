@@ -25,6 +25,93 @@ from scipy.stats import norm as _norm
 
 
 # ============================================================================
+# MARKET REGIME — live detection from price + vol data
+# ============================================================================
+
+
+class MarketRegime(Enum):
+    CALM_BULL    = "calm_bull"      # VIX 12-18, trending up  → loosen sell filters
+    ELEVATED_VOL = "elevated_vol"   # VIX 18-28, choppy       → tighter filters
+    TRENDING_BEAR = "trending_bear" # VIX 28-45, downtrend    → almost no condors
+    CRASH        = "crash"          # VIX 45+, extreme moves  → long vol only
+    RECOVERY     = "recovery"       # VIX falling from high   → moderate sells
+
+
+# Per-regime entry/exit parameters — the core of adaptive filtering
+_REGIME_PARAMS: Dict[str, dict] = {
+    # ── CALM BULL ─────────────────────────────────────────────────────────────
+    # Low realized vol, IV/RV structurally > 1.3 — ideal condor environment.
+    # Loosen thresholds: enter more often, hold to 50% profit.
+    "calm_bull": {
+        "sell_threshold":  68.0,   # sell condors when IV%ile > 68 (was 75)
+        "buy_threshold":   32.0,
+        "iv_rv_sell_min":  1.30,   # only need IV/RV > 1.3x to sell
+        "iv_rv_buy_max":   1.25,
+        "take_profit_pct": 0.50,
+        "stop_loss_mult":  2.00,
+        "min_interval_h":  20,
+        "capital_pct":     0.030,  # 3% of capital per trade — plenty of edge here
+        "min_contracts":   2,
+    },
+    # ── ELEVATED VOL ──────────────────────────────────────────────────────────
+    # Choppy/uncertain. IV/RV less reliable. Require stronger signal.
+    "elevated_vol": {
+        "sell_threshold":  76.0,
+        "buy_threshold":   24.0,
+        "iv_rv_sell_min":  1.55,
+        "iv_rv_buy_max":   1.10,
+        "take_profit_pct": 0.40,   # take profit faster
+        "stop_loss_mult":  1.75,   # tighter stop — don't let elevated vol hurt you
+        "min_interval_h":  30,
+        "capital_pct":     0.020,  # 2% — more uncertain, reduce exposure
+        "min_contracts":   1,
+    },
+    # ── TRENDING BEAR ─────────────────────────────────────────────────────────
+    # Sustained downtrend, VIX 28-45. Condors lose because spot keeps moving.
+    # Require extreme IV oversell (88th %ile + IV/RV > 1.8) to even consider.
+    # Never sell if IV/RV < 1.0 (market moving faster than IV prices in).
+    "trending_bear": {
+        "sell_threshold":  88.0,
+        "buy_threshold":   18.0,
+        "iv_rv_sell_min":  1.80,
+        "iv_rv_buy_max":   1.00,   # buy only if IV is cheaper than realized vol
+        "take_profit_pct": 0.35,   # grab profits fast before reversal unwinds
+        "stop_loss_mult":  1.50,   # tight — no room for losers in bear markets
+        "min_interval_h":  48,     # very selective entries
+        "capital_pct":     0.010,  # 1% max — brutal environment, stay small
+        "min_contracts":   1,
+    },
+    # ── CRASH ─────────────────────────────────────────────────────────────────
+    # VIX 45+. NEVER sell condors. Only buy straddles.
+    # IV spikes are the position — let them run to 150%+ profit.
+    "crash": {
+        "sell_threshold":  999.0,  # disabled
+        "buy_threshold":   15.0,
+        "iv_rv_sell_min":  999.0,  # disabled
+        "iv_rv_buy_max":   1.30,   # buy when IV overshoots RV slightly — COVID spike
+        "take_profit_pct": 1.50,   # let crash vol runs pay 2.5x
+        "stop_loss_mult":  3.00,
+        "min_interval_h":  12,     # re-enter quickly — crash regimes are fast
+        "capital_pct":     0.008,  # 0.8% — tiny size, outsized leverage in vol
+        "min_contracts":   1,
+    },
+    # ── RECOVERY ──────────────────────────────────────────────────────────────
+    # Vol falling from elevated levels. Good for condors once IV/RV > 1.4.
+    "recovery": {
+        "sell_threshold":  72.0,
+        "buy_threshold":   28.0,
+        "iv_rv_sell_min":  1.40,
+        "iv_rv_buy_max":   1.20,
+        "take_profit_pct": 0.45,
+        "stop_loss_mult":  1.75,
+        "min_interval_h":  24,
+        "capital_pct":     0.020,  # 2% — vol falling is good but stay measured
+        "min_contracts":   1,
+    },
+}
+
+
+# ============================================================================
 # SIGNAL MODEL
 # ============================================================================
 
@@ -145,29 +232,25 @@ class VolatilityMeanReversionStrategy(Strategy):
     def __init__(
         self,
         lookback_days: int = 30,
-        buy_threshold: float = 25.0,
-        sell_threshold: float = 75.0,
         min_confidence: float = 0.45,
-        min_signal_interval_hours: float = 4.0,
         max_hold_days: int = 45,
-        iv_rv_buy_max: float = 1.2,
-        iv_rv_sell_min: float = 1.4,
-        take_profit_pct: float = 0.50,   # close short at 50% of max profit
-        stop_loss_mult: float = 2.00,    # stop loss at 200% of premium collected
-        dte_close: int = 21,             # close when DTE reaches this level
+        dte_close: int = 21,
+        # Sizing — base sizing uses capital_pct floor; Kelly scales it up
+        min_contracts: int = 2,
+        max_contracts: int = 15,
+        capital_pct_per_trade: float = 0.03,  # 3% of capital at risk per trade
     ):
         super().__init__("VolMeanReversion")
         self.lookback_days = lookback_days
-        self.buy_threshold = buy_threshold
-        self.sell_threshold = sell_threshold
         self.min_confidence = min_confidence
-        self.min_signal_interval = timedelta(hours=min_signal_interval_hours)
         self.max_hold_days = max_hold_days
-        self.iv_rv_buy_max = iv_rv_buy_max
-        self.iv_rv_sell_min = iv_rv_sell_min
-        self.take_profit_pct = take_profit_pct
-        self.stop_loss_mult = stop_loss_mult
         self.dte_close = dte_close
+        self.min_contracts = min_contracts
+        self.max_contracts = max_contracts
+        self.capital_pct_per_trade = capital_pct_per_trade
+
+        # These remain as fallbacks when regime detection has insufficient history
+        self._default_params = _REGIME_PARAMS["elevated_vol"]
 
         self._price_history: Dict[str, List[float]] = {}
         self._iv_history: Dict[str, List[float]] = {}
@@ -285,11 +368,61 @@ class VolatilityMeanReversionStrategy(Strategy):
             return 50.0
         return float(sum(1 for v in hist if current_iv >= v) / len(hist) * 100)
 
-    def _can_signal(self, symbol: str, now: datetime) -> bool:
+    def _detect_market_regime(
+        self, sym: str, implied_vol: float, iv_rv: float
+    ) -> MarketRegime:
+        """
+        Classify the current market environment from price history and vol metrics.
+
+        Detection priority (highest to lowest):
+          CRASH        — IV >= 0.45 (extreme fear, VIX equivalent)
+          TRENDING_BEAR — IV >= 0.28 AND (price downtrend OR IV/RV < 1.05)
+          ELEVATED_VOL — IV >= 0.22 OR IV/RV < 1.15 (vol structurally high)
+          RECOVERY     — IV was high recently but now falling (mean reverting down)
+          CALM_BULL    — default low-vol uptrend environment
+        """
+        prices  = self._price_history.get(sym, [])
+        iv_hist = self._iv_history.get(sym, [])
+
+        # 20-day price momentum
+        momentum_20d = 0.0
+        if len(prices) >= 20:
+            momentum_20d = (prices[-1] - prices[-20]) / max(prices[-20], 1e-6)
+
+        # Is IV falling from recent elevated levels? (recovery signature)
+        iv_was_high = False
+        iv_falling  = False
+        if len(iv_hist) >= 15:
+            recent_peak = max(iv_hist[-15:])
+            iv_was_high = recent_peak >= 0.25
+            iv_falling  = iv_hist[-1] < recent_peak * 0.85   # dropped >15% from peak
+
+        if implied_vol >= 0.45:
+            return MarketRegime.CRASH
+
+        if implied_vol >= 0.28 and (momentum_20d < -0.04 or iv_rv < 1.05):
+            return MarketRegime.TRENDING_BEAR
+
+        if iv_was_high and iv_falling and implied_vol >= 0.20:
+            return MarketRegime.RECOVERY
+
+        if implied_vol >= 0.22 or iv_rv < 1.15:
+            return MarketRegime.ELEVATED_VOL
+
+        return MarketRegime.CALM_BULL
+
+    def _regime_params(self, sym: str, implied_vol: float, iv_rv: float) -> dict:
+        """Return the entry/exit parameter dict for the current market regime."""
+        regime = self._detect_market_regime(sym, implied_vol, iv_rv)
+        params = _REGIME_PARAMS[regime.value]
+        logger.debug(f"[{self.name}] {sym} regime={regime.value} iv={implied_vol:.2%} iv_rv={iv_rv:.2f}")
+        return params
+
+    def _can_signal(self, symbol: str, now: datetime, min_interval_h: float = 24.0) -> bool:
         last = self._last_signal.get(symbol)
         if last is None:
             return True
-        return now - last >= self.min_signal_interval
+        return now - last >= timedelta(hours=min_interval_h)
 
     def update_portfolio_state(
         self, current_value: float, peak_value: float, capital: float
@@ -297,36 +430,51 @@ class VolatilityMeanReversionStrategy(Strategy):
         """Receive current portfolio value from the simulation loop (used for Kelly sizing)."""
         self._capital = capital
 
-    def _kelly_position_size(self, risk_per_contract: float) -> int:
+    def _position_size(self, risk_per_contract: float, rp: dict) -> int:
         """
-        Quarter-Kelly position sizing from rolling trade history.
+        Hybrid base-sizing + quarter-Kelly position sizing.
 
-        f* = (win_rate * avg_win - loss_rate * avg_loss) / avg_win
-        f_quarter = f* * 0.25   (standard safety scaling)
-        contracts = floor(capital * f_quarter / risk_per_contract)
+        Base sizing (always active):
+          target_risk = capital * capital_pct   (regime-specific, e.g. 3% calm, 1% bear)
+          base_contracts = max(min_contracts, floor(target_risk / risk_per_contract))
 
-        Falls back to 1 contract if fewer than 10 completed trades.
-        Capped at 10 contracts to limit single-trade risk.
+          At $100k calm_bull + $700 risk/contract: base = max(2, floor(3000/700)) = 4
+          At $100k trending_bear + $525 risk/contract: base = max(1, floor(1000/525)) = 1
+
+        Quarter-Kelly multiplier (once 10+ trades recorded):
+          f* = (W * avg_win - L * avg_loss) / avg_win
+          If f_quarter > 0 and kelly_contracts > base_contracts, use kelly_contracts.
+          This grows sizing as proven edge accumulates but never below base.
+
+        Capped at max_contracts (default 15).
         """
-        if len(self._trade_log) < 10 or risk_per_contract <= 0:
-            return 1
-        wins   = [p for p in self._trade_log if p > 0]
-        losses = [abs(p) for p in self._trade_log if p < 0]
-        if not wins or not losses:
-            return 1
+        capital = max(self._capital, 10_000.0)
+        risk_per_contract = max(risk_per_contract, 1.0)
 
-        win_rate  = len(wins) / len(self._trade_log)
-        loss_rate = 1.0 - win_rate
-        avg_win   = float(np.mean(wins))
-        avg_loss  = float(np.mean(losses))
+        # Regime-specific sizing: calm bull is generous, bear/crash is tiny
+        capital_pct = rp.get("capital_pct", self.capital_pct_per_trade)
+        min_c = rp.get("min_contracts", self.min_contracts)
 
-        if avg_win <= 0:
-            return 1
-        f_star    = (win_rate * avg_win - loss_rate * avg_loss) / avg_win
-        f_quarter = max(0.0, f_star * 0.25)
+        base = max(
+            min_c,
+            int(capital * capital_pct / risk_per_contract),
+        )
 
-        contracts = max(1, int(f_quarter * self._capital / risk_per_contract))
-        return min(contracts, 10)
+        # Kelly multiplier once history exists
+        if len(self._trade_log) >= 10:
+            wins   = [p for p in self._trade_log if p > 0]
+            losses = [abs(p) for p in self._trade_log if p < 0]
+            if wins and losses:
+                win_rate = len(wins) / len(self._trade_log)
+                avg_win  = float(np.mean(wins))
+                avg_loss = float(np.mean(losses))
+                if avg_win > 0:
+                    f_star    = (win_rate * avg_win - (1 - win_rate) * avg_loss) / avg_win
+                    f_quarter = max(0.0, f_star * 0.25)
+                    kelly = int(f_quarter * capital / risk_per_contract)
+                    base  = max(base, kelly)
+
+        return min(base, self.max_contracts)
 
     def _next_expiry(self, weeks_out: int = 4, ref_date=None) -> str:
         """Return the next options expiry (weekly, ~N weeks out) from ref_date."""
@@ -476,28 +624,32 @@ class VolatilityMeanReversionStrategy(Strategy):
                     S=candle.close, K=entry_spot, iv=implied_vol, T=T_now
                 )
 
+            # Use regime-aware exit params based on CURRENT market conditions
+            rp = self._regime_params(sym, implied_vol, iv_rv)
+            take_profit_pct = rp["take_profit_pct"]
+            stop_loss_mult  = rp["stop_loss_mult"]
+
             exit_reason: Optional[str] = None
 
             # Rule 1 — 21 DTE management: close before pin/gamma risk explodes
             if dte <= self.dte_close:
                 exit_reason = f"dte_{int(dte)}_management"
 
-            # Rule 2 — 50% of max profit (short: premium decayed; long: premium grew)
+            # Rule 2 — take profit (regime-aware threshold)
             elif entry_premium > 0 and pos_type == "short":
                 profit_pct = (entry_premium - current_premium) / entry_premium
-                if profit_pct >= self.take_profit_pct:
-                    exit_reason = "take_profit_50pct"
-                # Rule 3 — stop loss at 200% of premium collected
-                elif current_premium >= self.stop_loss_mult * entry_premium:
-                    exit_reason = "stop_loss_200pct"
+                if profit_pct >= take_profit_pct:
+                    exit_reason = f"take_profit_{take_profit_pct:.0%}"
+                # Rule 3 — stop loss (regime-aware multiplier)
+                elif current_premium >= stop_loss_mult * entry_premium:
+                    exit_reason = f"stop_loss_{stop_loss_mult:.0f}x"
 
             elif entry_premium > 0 and pos_type == "long":
                 profit_pct = (current_premium - entry_premium) / entry_premium
-                if profit_pct >= self.take_profit_pct:
-                    exit_reason = "take_profit_50pct"
-                # Stop long at 200% of premium paid (lost 2x what we put in)
-                elif current_premium <= entry_premium / self.stop_loss_mult:
-                    exit_reason = "stop_loss_200pct"
+                if profit_pct >= take_profit_pct:
+                    exit_reason = f"take_profit_{take_profit_pct:.0%}"
+                elif current_premium <= entry_premium / stop_loss_mult:
+                    exit_reason = f"stop_loss_{stop_loss_mult:.0f}x"
 
             # Rule 4 — IV mean reversion complete
             elif (
@@ -558,22 +710,29 @@ class VolatilityMeanReversionStrategy(Strategy):
                 ))
 
         # ------------------------------------------------------------------ #
-        # ENTRY LOGIC — gated by signal cooldown                              #
+        # ENTRY LOGIC — regime-aware filters + hybrid sizing                  #
         # ------------------------------------------------------------------ #
-        if not self._can_signal(sym, now):
+        rp = self._regime_params(sym, implied_vol, iv_rv)
+        if not self._can_signal(sym, now, min_interval_h=rp["min_interval_h"]):
             return None
 
-        # --- BUY vol: IV is cheap ---
-        if iv_pct < self.buy_threshold and iv_rv < self.iv_rv_buy_max and not pos and not self._positions.get(sym):
-            conf = (self.buy_threshold - iv_pct) / self.buy_threshold
+        sell_threshold  = rp["sell_threshold"]
+        buy_threshold   = rp["buy_threshold"]
+        iv_rv_sell_min  = rp["iv_rv_sell_min"]
+        iv_rv_buy_max   = rp["iv_rv_buy_max"]
+        stop_loss_mult  = rp["stop_loss_mult"]
+        regime          = self._detect_market_regime(sym, implied_vol, iv_rv)
+
+        # --- BUY vol: IV is cheap relative to regime ---
+        if iv_pct < buy_threshold and iv_rv < iv_rv_buy_max and not pos and not self._positions.get(sym):
+            conf = (buy_threshold - iv_pct) / max(buy_threshold, 1.0)
             if conf < self.min_confidence:
                 return None
             expiry = self._next_expiry(weeks_out=4, ref_date=now.date())
             T_entry = (4 * 7) / 365.0
             entry_premium = self._straddle_value(candle.close, candle.close, implied_vol, T_entry)
-            # Kelly: risk on long straddle = premium paid if it expires worthless
             risk_per_contract = max(entry_premium * 100, 1.0)
-            position_size = self._kelly_position_size(risk_per_contract)
+            position_size = self._position_size(risk_per_contract, rp)
             self._last_signal[sym] = now
             self._positions[sym] = {
                 "type": "long",
@@ -602,13 +761,14 @@ class VolatilityMeanReversionStrategy(Strategy):
                     "implied_vol": implied_vol,
                     "entry_premium": entry_premium,
                     "reason": "buy_cheap_vol",
-                    "kelly_contracts": position_size,
+                    "market_regime": regime.value,
+                    "contracts": position_size,
                 },
             ))
 
-        # --- SELL vol: IV is rich ---
-        if iv_pct > self.sell_threshold and iv_rv > self.iv_rv_sell_min and not pos and not self._positions.get(sym):
-            conf = (iv_pct - self.sell_threshold) / (100 - self.sell_threshold)
+        # --- SELL vol: IV is rich relative to regime ---
+        if iv_pct > sell_threshold and iv_rv > iv_rv_sell_min and not pos and not self._positions.get(sym):
+            conf = (iv_pct - sell_threshold) / max(100 - sell_threshold, 1.0)
             if conf < self.min_confidence:
                 return None
             expiry = self._next_expiry(weeks_out=6, ref_date=now.date())
@@ -616,9 +776,8 @@ class VolatilityMeanReversionStrategy(Strategy):
             entry_premium = self._condor_net_value(
                 S=candle.close, entry_spot=candle.close, iv=implied_vol, T=T_entry
             )
-            # Kelly: max loss on condor = stop_loss_mult × credit received
-            risk_per_contract = max(self.stop_loss_mult * entry_premium * 100, 1.0)
-            position_size = self._kelly_position_size(risk_per_contract)
+            risk_per_contract = max(stop_loss_mult * entry_premium * 100, 1.0)
+            position_size = self._position_size(risk_per_contract, rp)
             self._last_signal[sym] = now
             self._positions[sym] = {
                 "type": "short",
@@ -647,7 +806,8 @@ class VolatilityMeanReversionStrategy(Strategy):
                     "implied_vol": implied_vol,
                     "entry_premium": entry_premium,
                     "reason": "sell_rich_vol",
-                    "kelly_contracts": position_size,
+                    "market_regime": regime.value,
+                    "contracts": position_size,
                 },
             ))
 
