@@ -217,10 +217,24 @@ class PaperTradingExecutor(ExecutionEngine):
     async def _submit_order(self, order: Order) -> None:
         """Simulate fill immediately using current market price."""
         order.status = OrderStatus.ACCEPTED
-        mid = self._market_prices.get(order.symbol, order.price or 1.0)
-        if mid is None or mid <= 0:
-            logger.warning(f"No market price for {order.symbol} — using order price or $1")
-            mid = order.price or 1.0
+        underlying = self._market_prices.get(order.symbol)
+
+        # Options orders carry their Bachelier-estimated premium in order.price.
+        # Use that as the fill mid when:
+        #   (a) order.price is set, AND
+        #   (b) it looks like an option premium — i.e., < 20% of the underlying
+        #       (avoids accidentally using an underlying price stored in order.price)
+        if (
+            order.price is not None
+            and order.price > 0
+            and (underlying is None or order.price < 0.20 * underlying)
+        ):
+            mid = order.price
+        elif underlying is not None and underlying > 0:
+            mid = underlying
+        else:
+            logger.warning(f"No market price for {order.symbol} — using $1 fallback")
+            mid = 1.0
 
         await self._simulate_fill(order, mid)
 
@@ -351,30 +365,44 @@ def signal_to_orders(signal, mid_price: float) -> List[Order]:
         ))
 
     elif signal.signal_type == SignalType.STRADDLE:
-        # Buy ATM call + ATM put
+        # Buy ATM call + ATM put.
+        # entry_premium from metadata = Bachelier ATM straddle value.
+        # Split evenly: each leg ≈ half the straddle premium.
+        ep = signal.metadata.get("entry_premium", mid_price * 0.01)
+        leg_price = max(ep / 2, 0.01)
         for opt_type in ("CALL", "PUT"):
             orders.append(Order(
                 order_id="", option_type=opt_type, strike=signal.strike,
                 side=OrderSide.BUY, quantity=signal.position_size,
-                price=mid_price, **common,
+                price=leg_price, **common,
             ))
 
     elif signal.signal_type == SignalType.STRANGLE:
-        # Buy OTM call (strike + 5%) + OTM put (strike - 5%)
+        # Buy OTM call (strike + 5%) + OTM put (strike - 5%).
+        ep = signal.metadata.get("entry_premium", mid_price * 0.01)
+        leg_price = max(ep * 0.40, 0.01)  # OTM ≈ 40% of ATM premium per leg
         orders.append(Order(
             order_id="", option_type="CALL", strike=signal.strike * 1.05,
             side=OrderSide.BUY, quantity=signal.position_size,
-            price=mid_price * 0.5, **common,
+            price=leg_price, **common,
         ))
         orders.append(Order(
             order_id="", option_type="PUT", strike=signal.strike * 0.95,
             side=OrderSide.BUY, quantity=signal.position_size,
-            price=mid_price * 0.5, **common,
+            price=leg_price, **common,
         ))
 
     elif signal.signal_type == SignalType.IRON_CONDOR:
-        # Sell ATM call + ATM put; buy wing protection (5% OTM)
-        # Short call spread + short put spread
+        # Short call spread (sell 2% OTM / buy 7% OTM) +
+        # short put spread  (sell 2% OTM / buy 7% OTM).
+        #
+        # Approximate leg pricing from Bachelier ATM premium (entry_premium):
+        #   2% OTM short leg ≈ 35% of ATM straddle premium per side
+        #   7% OTM long  leg ≈ 15% of ATM straddle premium per side
+        # Net credit ≈ 2*(35%-15%) = 40% of ATM straddle.
+        ep = signal.metadata.get("entry_premium", mid_price * 0.01)
+        sell_leg_price = max(ep * 0.35, 0.01)
+        buy_leg_price  = max(ep * 0.15, 0.01)
         for opt_type, sell_strike, buy_strike in [
             ("CALL", signal.strike * 1.02, signal.strike * 1.07),
             ("PUT",  signal.strike * 0.98, signal.strike * 0.93),
@@ -382,12 +410,12 @@ def signal_to_orders(signal, mid_price: float) -> List[Order]:
             orders.append(Order(
                 order_id="", option_type=opt_type, strike=sell_strike,
                 side=OrderSide.SELL, quantity=signal.position_size,
-                price=mid_price * 0.6, **common,
+                price=sell_leg_price, **common,
             ))
             orders.append(Order(
                 order_id="", option_type=opt_type, strike=buy_strike,
                 side=OrderSide.BUY, quantity=signal.position_size,
-                price=mid_price * 0.2, **common,
+                price=buy_leg_price, **common,
             ))
 
     elif signal.signal_type == SignalType.CLOSE_POSITION:

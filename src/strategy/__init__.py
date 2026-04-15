@@ -351,10 +351,22 @@ class VolatilityMeanReversionStrategy(Strategy):
             pos_type: str = pos["type"]
             entry_premium: float = pos.get("entry_premium", 0.0)
             expiry_str: str = pos.get("expiry", "")
+            # Use the IV observed at entry — not the current AR(1) simulation value.
+            # This makes current_premium track theta decay + spot movement only,
+            # without spurious noise from the simulated IV process triggering
+            # false stop-losses or premature take-profits.
+            entry_iv: float = pos.get("entry_iv", implied_vol)
 
             days_held = (now - entry_time).days
             dte = self._dte(expiry_str, now)
-            current_premium = self._atm_premium(candle.close, implied_vol, dte)
+
+            # Mark-to-market: Bachelier with FIXED entry_iv, only spot + DTE move.
+            # This correctly captures:
+            #   • theta decay  (DTE decreasing each day)
+            #   • gamma P&L    (spot moving away from/toward strike)
+            # It deliberately ignores AR(1) IV noise so the exit conditions
+            # are driven by actual market moves, not simulated vol randomness.
+            current_premium = self._atm_premium(candle.close, entry_iv, dte)
 
             exit_reason: Optional[str] = None
 
@@ -391,6 +403,23 @@ class VolatilityMeanReversionStrategy(Strategy):
                 exit_reason = "max_hold_exceeded"
 
             if exit_reason:
+                # Estimated P&L (straddle-equivalent, pre-commission)
+                if entry_premium > 0:
+                    if pos_type == "short":
+                        est_pnl = (entry_premium - current_premium) * 100
+                    else:
+                        est_pnl = (current_premium - entry_premium) * 100
+                    pnl_str = f"+${est_pnl:.2f}" if est_pnl >= 0 else f"-${abs(est_pnl):.2f}"
+                else:
+                    pnl_str = "n/a"
+
+                logger.info(
+                    f"[{self.name}] EXIT {sym} {pos_type.upper()}: "
+                    f"reason={exit_reason}  "
+                    f"entry=${entry_premium:.3f}  current=${current_premium:.3f}  "
+                    f"dte={dte:.0f}  held={days_held}d  est_pnl={pnl_str}"
+                )
+
                 self._positions[sym] = {}
                 self._last_signal[sym] = now
                 return self._emit(Signal(
@@ -408,6 +437,7 @@ class VolatilityMeanReversionStrategy(Strategy):
                         "dte": dte,
                         "entry_premium": entry_premium,
                         "current_premium": current_premium,
+                        "entry_iv": entry_iv,
                         "reason": exit_reason,
                     },
                 ))
@@ -431,6 +461,8 @@ class VolatilityMeanReversionStrategy(Strategy):
                 "entry_time": now,
                 "entry_iv_pct": iv_pct,
                 "entry_premium": entry_premium,
+                "entry_iv": implied_vol,        # fixed for current_premium calc
+                "entry_spot": candle.close,
                 "expiry": expiry,
                 "confirmed": False,
             }
@@ -466,6 +498,8 @@ class VolatilityMeanReversionStrategy(Strategy):
                 "entry_time": now,
                 "entry_iv_pct": iv_pct,
                 "entry_premium": entry_premium,
+                "entry_iv": implied_vol,        # fixed for current_premium calc
+                "entry_spot": candle.close,
                 "expiry": expiry,
                 "confirmed": False,
             }

@@ -441,8 +441,51 @@ class BacktestRunner:
 
     async def _execute_signal(self, signal: Signal, mid_price: float) -> None:
         if signal.signal_type == SignalType.CLOSE_POSITION:
-            for pos in self.portfolio.positions_for_symbol(signal.symbol):
-                self.portfolio.close_position(pos.position_id, mid_price)
+            # Close each portfolio leg at the option's current estimated premium,
+            # not at the underlying stock price.
+            #
+            # The CLOSE signal from VolatilityMeanReversionStrategy carries
+            # current_premium = Bachelier(spot, entry_iv, dte) in metadata —
+            # a mark-to-market estimate of the ATM straddle value NOW.
+            #
+            # Per-leg close prices are proportional to how they were opened:
+            #   Short leg (qty<0): was sold at 35% of ATM premium → buy back at 35% of current
+            #   Long  leg (qty>0): was bought at 15% of ATM premium → sell at 15% of current
+            # This ensures realized P&L in the portfolio matches the strategy's tracking.
+            current_premium = signal.metadata.get("current_premium", None)
+            reason = signal.metadata.get("reason", "unknown")
+
+            positions = self.portfolio.positions_for_symbol(signal.symbol)
+            total_pnl = 0.0
+            for pos in positions:
+                if current_premium is not None:
+                    # Scale to per-leg price matching how legs were opened
+                    if pos.quantity < 0:
+                        close_price = current_premium * 0.35   # buy back short leg
+                    else:
+                        close_price = current_premium * 0.15   # sell long protective wing
+                else:
+                    close_price = mid_price * 0.01  # fallback (should not happen)
+
+                pnl = self.portfolio.close_position(pos.position_id, close_price)
+                if pnl is not None:
+                    total_pnl += pnl
+                    direction = "SHORT" if pos.quantity < 0 else "LONG"
+                    sign = "+" if pnl >= 0 else ""
+                    logger.info(
+                        f"CLOSED {pos.position_id} [{reason}]: "
+                        f"{direction} {pos.symbol} {pos.option_type} "
+                        f"K={pos.strike:.0f} exp={pos.expiry}  "
+                        f"entry=${pos.entry_price:.3f}  close=${close_price:.3f}  "
+                        f"pnl={sign}${pnl:.2f}"
+                    )
+
+            if positions:
+                net_sign = "+" if total_pnl >= 0 else ""
+                logger.info(
+                    f"  ↳ NET {signal.symbol} position: reason={reason}  "
+                    f"total_pnl={net_sign}${total_pnl:.2f}"
+                )
             return
 
         orders = signal_to_orders(signal, mid_price)

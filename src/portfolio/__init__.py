@@ -107,6 +107,7 @@ class OptionPosition:
             "current_price": self.current_price,
             "unrealized_pnl": self.unrealized_pnl,
             "realized_pnl": self.realized_pnl,
+            "pnl": self.realized_pnl,     # alias used by compute_performance win-rate calc
             "delta": self.delta,
             "gamma": self.gamma,
             "vega": self.vega,
@@ -300,7 +301,24 @@ class PortfolioManager:
     def close_position(
         self, position_id: str, close_price: float
     ) -> Optional[float]:
-        """Close a position by ID. Returns realized P&L or None if not found."""
+        """
+        Close a position by ID. Returns realized P&L or None if not found.
+
+        Cash accounting
+        ---------------
+        Mirrors the open transaction but in reverse:
+          open:  cash -= entry_price * quantity * 100
+                 (long: pay premium; short: receive premium as negative debit)
+          close: cash += close_price * quantity * 100
+                 (long: receive proceeds from sale; short: pay to buy back)
+
+        P&L = (close_price - entry_price) * quantity * 100
+            = net cash inflow from open + close combined.
+
+        Previous bug: sign was inverted AND realized P&L was added a second
+        time (double counting).  Correct formula uses only the closing
+        transaction cash flow.
+        """
         pos = self.positions.get(position_id)
         if pos is None:
             logger.warning(f"close_position: unknown id {position_id}")
@@ -310,8 +328,11 @@ class PortfolioManager:
             return pos.realized_pnl
 
         pnl = pos.close(close_price, datetime.utcnow())
-        self.cash += close_price * abs(pos.quantity) * 100 * (1 if pos.quantity < 0 else -1)
-        self.cash += pnl  # net P&L adjustment
+        # Closing transaction: reverse of open
+        #   Long (qty>0): sell to close → receive close_price * qty * 100
+        #   Short (qty<0): buy to close → pay close_price * |qty| * 100
+        # Both cases: cash += close_price * quantity * 100
+        self.cash += close_price * pos.quantity * 100
         self.closed_positions.append(pos)
         del self.positions[position_id]
         return pnl
