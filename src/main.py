@@ -325,6 +325,104 @@ class QuantBot:
 # ============================================================================
 
 
+# ============================================================================
+# HISTORICAL VOL REGIMES — calibrated to actual VIX/SPY data
+# ============================================================================
+
+_VOL_REGIMES: Dict[str, dict] = {
+    # ── 2024 ─────────────────────────────────────────────────────────────────
+    # SPY: ~475 → ~590  (+24%)
+    # VIX: ranged 12-20 most of the year
+    # Aug 5 Yen-carry unwind: VIX intraday 65, daily close ~38 (≈ trading day 145)
+    "2024": {
+        "label": "2024 Calm Bull (VIX 12-20, Aug spike to 65)",
+        "initial_price": 475.0,
+        "annual_drift": 0.24,
+        "base_vol": 0.135,
+        "long_run_vol": 0.155,
+        "vol_of_vol": 0.0035,
+        "vol_mean_rev": 0.06,
+        "vol_jump_prob": 0.003,
+        "vol_jump_mean": 0.04,
+        "iv_premium": 1.10,
+        "iv_seed_mean": 0.155,
+        "iv_seed_std": 0.025,
+        # Events: list of {tday_start, tday_end, vol_override, drift_override, vol_floor, iv_premium}
+        "events": [
+            # Aug 5 spike: VIX 65 intraday; 5-day chaos window (~trading days 145-152)
+            {"tday_start": 145, "tday_end": 152,
+             "vol_override": 0.55, "drift_override": -5.0, "iv_premium": 1.70},
+            # Cool-down rest of August — vol above normal but falling
+            {"tday_start": 152, "tday_end": 175,
+             "vol_floor": 0.20, "iv_premium": 1.25},
+        ],
+    },
+
+    # ── 2022 ─────────────────────────────────────────────────────────────────
+    # SPY: ~474 → ~380  (-19%)
+    # VIX: sustained 25-35 all year, peaked ~39 in Jun/Oct
+    "2022": {
+        "label": "2022 Bear Market (VIX sustained 25-35)",
+        "initial_price": 474.0,
+        "annual_drift": -0.19,
+        "base_vol": 0.26,
+        "long_run_vol": 0.29,
+        "vol_of_vol": 0.007,
+        "vol_mean_rev": 0.025,       # slow — vol stays elevated all year
+        "vol_jump_prob": 0.012,
+        "vol_jump_mean": 0.055,
+        "iv_premium": 1.18,
+        "iv_seed_mean": 0.28,
+        "iv_seed_std": 0.04,
+        "events": [],
+    },
+
+    # ── 2020 COVID ───────────────────────────────────────────────────────────
+    # SPY: 329 → 218 (crash) → 313 (partial recovery by Jun 30)
+    # VIX: 14 calm → 85 peak → gradual decline to ~30 by Jun
+    # Three-phase regime — processed sequentially by trading-day count
+    "covid_2020": {
+        "label": "COVID Crash 2020 (VIX 14 to 85 to 30)",
+        "initial_price": 329.0,
+        "iv_seed_mean": 0.155,
+        "iv_seed_std": 0.020,
+        "phases": [
+            # Phase 1 — calm pre-crash, Feb 1 – Feb 19 (~13 trading days)
+            {"max_tdays": 13,
+             "annual_drift": 0.10, "base_vol": 0.15,
+             "vol_start": 0.15, "vol_end": 0.18, "iv_premium": 1.05},
+            # Phase 2 — crash, Feb 20 – Mar 23 (~23 trading days)
+            # SPY fell from 337 → 218 = -35%; VIX spiked 15 → 85
+            {"max_tdays": 23,
+             "annual_drift": -2.80, "base_vol": 0.80,
+             "vol_start": 0.18, "vol_end": 0.85, "iv_premium": 1.45},
+            # Phase 3 — recovery, Mar 24 – Jun 30 (~69 trading days)
+            # SPY recovered 218 → 313 (+44%); VIX slowly back to ~30
+            {"max_tdays": 999,
+             "annual_drift": 1.70, "base_vol": 0.40,
+             "vol_start": 0.82, "vol_end": 0.30, "iv_premium": 1.25},
+        ],
+    },
+
+    # ── Generic ──────────────────────────────────────────────────────────────
+    "generic": {
+        "label": "Generic (no regime)",
+        "initial_price": 450.0,
+        "annual_drift": 0.08,
+        "base_vol": 0.18,
+        "long_run_vol": 0.18,
+        "vol_of_vol": 0.005,
+        "vol_mean_rev": 0.03,
+        "vol_jump_prob": 0.02,
+        "vol_jump_mean": 0.05,
+        "iv_premium": 1.08,
+        "iv_seed_mean": 0.18,
+        "iv_seed_std": 0.03,
+        "events": [],
+    },
+}
+
+
 class BacktestRunner:
     """
     Full event-driven backtest with strategy signals, LLM validation,
@@ -368,17 +466,62 @@ class BacktestRunner:
         self.end_date: Optional[datetime] = None
         self._prev_portfolio_value: float = 100_000.0
 
-    async def run(self, start_date: str, end_date: str) -> dict:
-        self.start_date = datetime.strptime(start_date, "%Y-%m-%d")
-        self.end_date = datetime.strptime(end_date, "%Y-%m-%d")
+    @staticmethod
+    def _detect_regime(start: datetime, end: datetime) -> str:
+        """Map a date range to the closest historical vol regime."""
+        sy, sm = start.year, start.month
+        if sy == 2024:
+            return "2024"
+        if sy == 2022:
+            return "2022"
+        if sy == 2020 and sm <= 6:
+            return "covid_2020"
+        return "generic"
 
-        logger.info(f"Backtest: {start_date} → {end_date} | LLM={'on' if self.reasoning_engine else 'off'}")
+    def _seed_regime_iv_history(self, regime: dict) -> None:
+        """
+        Pre-populate strategy IV history from regime parameters.
+        Without this, _iv_percentile() returns 50% for all first-day readings
+        and the strategy enters on wrong signals.
+        """
+        seed_mean = regime.get("iv_seed_mean", 0.20)
+        seed_std  = regime.get("iv_seed_std",  0.03)
+        rng = np.random.default_rng(seed=42)
+
+        for sym in self.config.symbols:
+            # Build a 30-day AR(1) seed anchored at the regime's typical IV
+            hist: List[float] = []
+            val = seed_mean
+            for _ in range(30):
+                val = val + 0.08 * (seed_mean - val) + rng.normal(0, seed_std * 0.3)
+                hist.append(float(np.clip(val, 0.04, 0.90)))
+            hist[-1] = seed_mean   # pin the last value to the regime anchor
+
+            for strategy in self.rule_engine.strategies:
+                if hasattr(strategy, "seed_iv_history"):
+                    strategy.seed_iv_history(sym, hist)
+
+    async def run(self, start_date: str, end_date: str, regime_key: str = "auto") -> dict:
+        self.start_date = datetime.strptime(start_date, "%Y-%m-%d")
+        self.end_date   = datetime.strptime(end_date,   "%Y-%m-%d")
+
+        if regime_key == "auto":
+            regime_key = self._detect_regime(self.start_date, self.end_date)
+        regime = _VOL_REGIMES.get(regime_key, _VOL_REGIMES["generic"])
+
+        logger.info(
+            f"Backtest: {start_date} → {end_date} | "
+            f"regime={regime['label']} | LLM={'on' if self.reasoning_engine else 'off'}"
+        )
 
         try:
             await self.data_connector.connect()
-            market_data = self._generate_market_data()
+            self._seed_regime_iv_history(regime)
+            market_data = self._generate_market_data(regime)
             await self._run_simulation(market_data)
-            return self._build_results()
+            result = self._build_results()
+            result["regime"] = regime["label"]
+            return result
         except Exception as e:
             logger.exception(f"Backtest failed: {e}")
             return {"status": "FAILED", "error": str(e)}
@@ -386,6 +529,38 @@ class BacktestRunner:
             await self.data_connector.disconnect()
             if self.reasoning_engine:
                 await self.reasoning_engine.client.close()
+
+    def _bsm_mark_portfolio(self, spot: float, iv: float, current_date: datetime) -> None:
+        """
+        Mark every open option position at its Black-Scholes theoretical value.
+
+        Replaces the broken mark_all(underlying_prices) which marked options
+        at the underlying stock price (e.g. $590 for SPY) instead of the
+        option premium (~$5-$15), producing huge phantom unrealized P&L.
+
+        Uses each position's actual strike and option_type so the equity
+        curve correctly reflects option decay, vol expansion, and spot moves.
+        """
+        from scipy.stats import norm as _n
+        sigma = max(iv, 0.01)
+        for pos in self.portfolio.positions.values():
+            try:
+                exp = datetime.strptime(pos.expiry, "%Y-%m-%d")
+                T = max((exp - current_date).days, 0) / 365.0
+                K = pos.strike
+                if T <= 1e-6:
+                    mark = max(spot - K, 0.0) if pos.option_type == "CALL" else max(K - spot, 0.0)
+                else:
+                    sq = sigma * T ** 0.5
+                    d1 = (np.log(spot / K) + 0.5 * sigma ** 2 * T) / sq
+                    d2 = d1 - sq
+                    if pos.option_type == "CALL":
+                        mark = float(spot * _n.cdf(d1) - K * _n.cdf(d2))
+                    else:
+                        mark = float(K * _n.cdf(-d2) - spot * _n.cdf(-d1))
+                pos.mark(max(mark, 0.0))
+            except Exception:
+                pass   # leave current_price unchanged on error
 
     async def _run_simulation(self, market_data: Dict[datetime, List[Candle]]) -> None:
         current = self.start_date
@@ -401,8 +576,8 @@ class BacktestRunner:
                 self.analysis.on_price(candle.symbol, candle.close)
                 self.executor.set_market_price(candle.symbol, candle.close)
 
-                # Mark open positions
-                self.portfolio.mark_all({candle.symbol: candle.close})
+                # Mark open positions at BSM theoretical value (not underlying price)
+                self._bsm_mark_portfolio(candle.close, candle.implied_vol or 0.20, current)
 
                 # Collect strategy signals; sync IV estimates into analysis engine
                 signals = []
@@ -441,31 +616,38 @@ class BacktestRunner:
 
     async def _execute_signal(self, signal: Signal, mid_price: float) -> None:
         if signal.signal_type == SignalType.CLOSE_POSITION:
-            # Close each portfolio leg at the option's current estimated premium,
-            # not at the underlying stock price.
-            #
-            # The CLOSE signal from VolatilityMeanReversionStrategy carries
-            # current_premium = Bachelier(spot, entry_iv, dte) in metadata —
-            # a mark-to-market estimate of the ATM straddle value NOW.
-            #
-            # Per-leg close prices are proportional to how they were opened:
-            #   Short leg (qty<0): was sold at 35% of ATM premium → buy back at 35% of current
-            #   Long  leg (qty>0): was bought at 15% of ATM premium → sell at 15% of current
-            # This ensures realized P&L in the portfolio matches the strategy's tracking.
-            current_premium = signal.metadata.get("current_premium", None)
-            reason = signal.metadata.get("reason", "unknown")
+            # Close each leg at its actual BSM market value using:
+            #   - current spot   = signal.strike (set to candle.close by strategy)
+            #   - current IV     = signal.metadata["current_iv"]
+            #   - DTE            = signal.metadata["dte"]
+            #   - per-leg strike = pos.strike  (exact strike from the original fill)
+            #   - option type    = pos.option_type
+            from scipy.stats import norm as _n
+            import math as _math
 
-            positions = self.portfolio.positions_for_symbol(signal.symbol)
-            total_pnl = 0.0
+            reason      = signal.metadata.get("reason", "unknown")
+            current_iv  = max(signal.metadata.get("current_iv", signal.metadata.get("entry_iv", 0.20)), 0.01)
+            dte         = signal.metadata.get("dte", 21)
+            T_close     = max(dte, 0) / 365.0
+            spot        = signal.strike    # strategy sets signal.strike = candle.close
+
+            positions   = self.portfolio.positions_for_symbol(signal.symbol)
+            total_pnl   = 0.0
+
             for pos in positions:
-                if current_premium is not None:
-                    # Scale to per-leg price matching how legs were opened
-                    if pos.quantity < 0:
-                        close_price = current_premium * 0.35   # buy back short leg
-                    else:
-                        close_price = current_premium * 0.15   # sell long protective wing
+                # BSM price for this specific leg
+                K = pos.strike
+                sigma = current_iv
+                if T_close <= 1e-6:
+                    close_price = max(spot - K, 0.0) if pos.option_type == "CALL" else max(K - spot, 0.0)
                 else:
-                    close_price = mid_price * 0.01  # fallback (should not happen)
+                    sq = sigma * T_close ** 0.5
+                    d1 = (_math.log(spot / K) + 0.5 * sigma**2 * T_close) / sq
+                    d2 = d1 - sq
+                    if pos.option_type == "CALL":
+                        close_price = max(float(spot * _n.cdf(d1) - K * _n.cdf(d2)), 0.01)
+                    else:
+                        close_price = max(float(K * _n.cdf(-d2) - spot * _n.cdf(-d1)), 0.01)
 
                 pnl = self.portfolio.close_position(pos.position_id, close_price)
                 if pnl is not None:
@@ -483,8 +665,8 @@ class BacktestRunner:
             if positions:
                 net_sign = "+" if total_pnl >= 0 else ""
                 logger.info(
-                    f"  ↳ NET {signal.symbol} position: reason={reason}  "
-                    f"total_pnl={net_sign}${total_pnl:.2f}"
+                    f"  NET {signal.symbol}: reason={reason}  IV={current_iv:.1%}  "
+                    f"DTE={dte:.0f}  total_pnl={net_sign}${total_pnl:.2f}"
                 )
             return
 
@@ -514,22 +696,41 @@ class BacktestRunner:
                 if hasattr(strategy, "confirm_entry"):
                     strategy.confirm_entry(signal.symbol)
 
-    def _generate_market_data(self) -> Dict[datetime, List[Candle]]:
+    def _generate_market_data(self, regime: dict) -> Dict[datetime, List[Candle]]:
         """
-        Generate realistic synthetic market data for the backtest period.
+        Generate historically-calibrated synthetic market data.
 
-        Model: Geometric Brownian Motion with:
-          - Mean-reverting volatility (Heston-like vol-of-vol)
-          - Occasional vol spikes (jump process)
-          - Intraday volume profile (U-shaped)
-          - Bid/ask spread proportional to vol
+        Each regime specifies a GBM process with:
+          - Historically accurate drift + starting vol
+          - Mean-reverting vol process (GARCH-like) or phase-based (COVID)
+          - Event overlays for discrete shocks (Aug 2024 VIX spike)
+          - implied_vol and hv30 injected into each candle so strategy
+            entry/exit decisions use regime-appropriate IV
+
+        NOTE: The Bachelier ATM formula tracks P&L only via spot movement
+        and theta decay — it does NOT reprice individual legs by moneyness.
+        This means deep-ITM losses (COVID crash) are underestimated.  The
+        results below show directionally correct behaviour (more losses in
+        stress regimes) but absolute drawdowns are understated for extreme
+        spot moves.  Full per-strike BSM pricing is the next milestone.
         """
         data: Dict[datetime, List[Candle]] = {}
         current = self.start_date
 
-        # Per-symbol state
+        is_phased = "phases" in regime
+        rng = np.random.default_rng(seed=0)   # reproducible runs
+
+        # ── Shared state ────────────────────────────────────────────────────
+        initial_price = regime.get("initial_price", 450.0)
         symbol_state = {
-            sym: {"price": 450.0 if sym in ("SPY", "SPX") else 100.0, "vol": 0.18}
+            sym: {
+                "price": initial_price if sym in ("SPY", "SPX") else initial_price / 4.5,
+                "vol": regime.get("base_vol", 0.18) if not is_phased
+                       else regime["phases"][0]["vol_start"],
+                "trading_day": 0,
+                "phase_idx": 0,
+                "phase_tday": 0,  # trading days elapsed within current phase
+            }
             for sym in self.config.symbols
         }
 
@@ -540,46 +741,107 @@ class BacktestRunner:
 
             for sym in self.config.symbols:
                 state = symbol_state[sym]
-                candles = []
-                base_price = state["price"]
-                vol = state["vol"]
+                base_price: float = state["price"]
+                tday: int         = state["trading_day"]
 
-                for minute in range(390):
-                    time_of_day = minute / 390
-                    # U-shaped intraday vol (higher at open/close)
-                    intraday_vol_mult = 1.0 + 0.5 * (1 - 4 * (time_of_day - 0.5) ** 2)
+                # ── Determine today's vol + drift ────────────────────────────
+                if is_phased:
+                    phases = regime["phases"]
+                    pidx = state["phase_idx"]
+                    ptday = state["phase_tday"]
+                    phase = phases[min(pidx, len(phases) - 1)]
 
-                    # Per-minute price change
-                    dt = 1 / (252 * 390)
-                    daily_drift = 0.08 / 252          # ~8% annual drift
-                    rand = np.random.standard_normal()
-                    price_change = base_price * (
-                        daily_drift * dt + vol * intraday_vol_mult * np.sqrt(dt) * rand
-                    )
-                    base_price = max(base_price + price_change, 1.0)
-
-                    # Intraday volume (U-shaped)
-                    vol_factor = 1.0 + 1.5 * abs(time_of_day - 0.5)
-                    volume = int(np.random.lognormal(10, 0.5) * vol_factor)
-
-                    spread = base_price * 0.0002 * (1 + vol)
-                    candles.append(Candle(
-                        symbol=sym,
-                        timestamp=current.replace(hour=9, minute=30) + timedelta(minutes=minute),
-                        open=base_price - spread / 2,
-                        high=base_price + abs(np.random.normal(0, base_price * vol * 0.002)),
-                        low=base_price - abs(np.random.normal(0, base_price * vol * 0.002)),
-                        close=base_price + spread / 2 * np.random.choice([-1, 1]),
-                        volume=volume,
-                        timeframe="1m",
+                    # Interpolate vol linearly across the phase
+                    progress = min(ptday / max(phase["max_tdays"] - 1, 1), 1.0)
+                    day_vol = float(np.interp(
+                        progress,
+                        [0.0, 1.0],
+                        [phase["vol_start"], phase["vol_end"]],
                     ))
+                    annual_drift = phase["annual_drift"]
+                    iv_premium   = phase["iv_premium"]
 
-                state["price"] = base_price
-                # Vol mean reversion with jumps
-                vol_jump = np.random.exponential(0.05) if np.random.random() < 0.02 else 0
-                vol = vol + 0.03 * (0.18 - vol) + np.random.normal(0, 0.005) + vol_jump
-                state["vol"] = float(np.clip(vol, 0.05, 0.80))
+                    # Advance phase if needed
+                    if ptday >= phase["max_tdays"] and pidx < len(phases) - 1:
+                        state["phase_idx"] += 1
+                        state["phase_tday"] = 0
+                    else:
+                        state["phase_tday"] += 1
 
+                else:
+                    # Continuous GARCH-like process with event overlays
+                    day_vol       = state["vol"]
+                    annual_drift  = regime.get("annual_drift", 0.08)
+                    iv_premium    = regime.get("iv_premium", 1.10)
+
+                    # Check event overlays (by trading day index)
+                    for ev in regime.get("events", []):
+                        if ev["tday_start"] <= tday < ev["tday_end"]:
+                            if "vol_override" in ev and ev["vol_override"] is not None:
+                                day_vol = ev["vol_override"]
+                            elif "vol_floor" in ev:
+                                day_vol = max(day_vol, ev["vol_floor"])
+                            if "drift_override" in ev:
+                                annual_drift = ev["drift_override"]
+                            iv_premium = ev.get("iv_premium", iv_premium)
+                            break
+
+                    # Mean-revert vol back toward long-run level (between days)
+                    long_run   = regime.get("long_run_vol", day_vol)
+                    rev_speed  = regime.get("vol_mean_rev", 0.05)
+                    vov        = regime.get("vol_of_vol", 0.004)
+                    vol_noise  = float(rng.normal(0, vov))
+                    next_vol   = day_vol + rev_speed * (long_run - day_vol) + vol_noise
+
+                    # Occasional vol jumps (macro shock)
+                    jprob = regime.get("vol_jump_prob", 0.005)
+                    if rng.random() < jprob:
+                        jump = float(rng.exponential(regime.get("vol_jump_mean", 0.05)))
+                        next_vol += jump
+                        logger.debug(f"[{sym}] Vol jump on day {tday}: +{jump:.3f}")
+
+                    state["vol"] = float(np.clip(next_vol, 0.04, 0.90))
+
+                # Clamp vol to physical range
+                day_vol = float(np.clip(day_vol, 0.04, 0.90))
+
+                # ── Today's implied vol for candles ───────────────────────────
+                # Add a small daily IV noise (±2% of the premium ratio) so
+                # IV percentile readings aren't perfectly deterministic.
+                iv_noise  = float(rng.normal(1.0, 0.02))
+                today_iv  = float(np.clip(day_vol * iv_premium * iv_noise, 0.04, 0.90))
+                today_hv30 = day_vol   # realized vol ≈ GBM process vol
+
+                # ── Generate one daily bar ────────────────────────────────────
+                # One candle per trading day so that the strategy's 30-day
+                # lookback_days (candles) maps correctly to 30 calendar days.
+                # Options strategies are daily decisions — intraday granularity
+                # adds noise without accuracy gain.
+                dt           = 1.0 / 252
+                daily_drift  = annual_drift / 252
+                rand         = float(rng.standard_normal())
+                price_change = base_price * (
+                    daily_drift * dt + day_vol * np.sqrt(dt) * rand
+                )
+                base_price = max(base_price + price_change, 1.0)
+
+                spread = base_price * 0.0002 * (1 + day_vol)
+                volume = int(float(rng.lognormal(12, 0.4)))
+                candles = [Candle(
+                    symbol=sym,
+                    timestamp=current.replace(hour=16, minute=0),  # EOD bar
+                    open=base_price  * (1 - day_vol * 0.005 * abs(float(rng.standard_normal()))),
+                    high=base_price  * (1 + day_vol * 0.008 * abs(float(rng.standard_normal()))),
+                    low=base_price   * (1 - day_vol * 0.008 * abs(float(rng.standard_normal()))),
+                    close=base_price,
+                    volume=volume,
+                    timeframe="1d",
+                    implied_vol=today_iv,
+                    hv30=today_hv30,
+                )]
+
+                state["price"]        = base_price
+                state["trading_day"] += 1
                 data[current] = candles
 
             current += timedelta(days=1)
@@ -640,12 +902,19 @@ def cli():
 @cli.command()
 @click.option("--start", default="2024-01-01", help="Start date (YYYY-MM-DD)")
 @click.option("--end", default="2024-12-31", help="End date (YYYY-MM-DD)")
-@click.option("--symbols", default="SPY,SPX", help="Comma-separated symbols")
+@click.option("--symbols", default="SPY", help="Comma-separated symbols")
 @click.option("--capital", default=100_000.0, type=float, help="Starting capital")
 @click.option("--no-llm", is_flag=True, default=False, help="Disable LLM validation")
 @click.option("--data-source", default="mock", type=click.Choice(["mock", "tastytrade"]))
-def backtest(start: str, end: str, symbols: str, capital: float, no_llm: bool, data_source: str):
-    """Run historical backtest."""
+@click.option(
+    "--regime",
+    default="auto",
+    type=click.Choice(["auto", "2024", "2022", "covid_2020", "generic"]),
+    help="Vol regime (default: auto-detect from date range)",
+)
+def backtest(start: str, end: str, symbols: str, capital: float, no_llm: bool,
+             data_source: str, regime: str):
+    """Run historical backtest with historically-calibrated vol regimes."""
     config = BotConfig(
         backtesting_mode=True,
         paper_trading=True,
@@ -654,10 +923,10 @@ def backtest(start: str, end: str, symbols: str, capital: float, no_llm: bool, d
     )
     connector = TastytradeConnector() if data_source == "tastytrade" else MockDataConnector()
     runner = BacktestRunner(config, connector)
-    results = asyncio.run(runner.run(start, end))
+    results = asyncio.run(runner.run(start, end, regime_key=regime))
 
     click.echo("\n" + "=" * 72)
-    click.echo("  BACKTEST RESULTS")
+    click.echo(f"  BACKTEST RESULTS  [{results.get('regime', 'unknown regime')}]")
     click.echo("=" * 72)
 
     fmt_fields = {
@@ -672,7 +941,7 @@ def backtest(start: str, end: str, symbols: str, capital: float, no_llm: bool, d
     }
 
     for key, value in results.items():
-        if key in ("status",):
+        if key in ("status", "regime"):
             continue
         label = key.replace("_", " ").title()
         if isinstance(value, float):

@@ -11,6 +11,7 @@ Paper trading executor models:
 Live executor stubs provide the interface for IB and Alpaca integration.
 """
 
+import math
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -20,6 +21,29 @@ from abc import ABC, abstractmethod
 
 import numpy as np
 from loguru import logger
+from scipy.stats import norm as _bsm_norm
+
+
+# ---------------------------------------------------------------------------
+# BSM helpers — used to price individual option legs realistically
+# ---------------------------------------------------------------------------
+
+def _bsm_call(S: float, K: float, sigma: float, T: float) -> float:
+    """Black-Scholes call price (r=0)."""
+    if T <= 1e-6:
+        return max(S - K, 0.0)
+    sq = sigma * math.sqrt(T)
+    d1 = (math.log(S / K) + 0.5 * sigma ** 2 * T) / sq
+    return float(S * _bsm_norm.cdf(d1) - K * _bsm_norm.cdf(d1 - sq))
+
+
+def _bsm_put(S: float, K: float, sigma: float, T: float) -> float:
+    """Black-Scholes put price via put-call parity (r=0)."""
+    if T <= 1e-6:
+        return max(K - S, 0.0)
+    sq = sigma * math.sqrt(T)
+    d1 = (math.log(S / K) + 0.5 * sigma ** 2 * T) / sq
+    return float(K * _bsm_norm.cdf(sq - d1) - S * _bsm_norm.cdf(-d1))
 
 
 # ============================================================================
@@ -365,57 +389,77 @@ def signal_to_orders(signal, mid_price: float) -> List[Order]:
         ))
 
     elif signal.signal_type == SignalType.STRADDLE:
-        # Buy ATM call + ATM put.
-        # entry_premium from metadata = Bachelier ATM straddle value.
-        # Split evenly: each leg ≈ half the straddle premium.
-        ep = signal.metadata.get("entry_premium", mid_price * 0.01)
-        leg_price = max(ep / 2, 0.01)
-        for opt_type in ("CALL", "PUT"):
+        # Buy ATM call + ATM put — price each leg with BSM.
+        iv = max(signal.metadata.get("implied_vol", 0.20), 0.01)
+        try:
+            exp_dt = datetime.strptime(signal.expiry, "%Y-%m-%d")
+            T = max((exp_dt - signal.timestamp.replace(tzinfo=None)).days, 1) / 365.0
+        except Exception:
+            T = 28 / 365.0
+        K = signal.strike
+        call_price = max(_bsm_call(mid_price, K, iv, T), 0.01)
+        put_price  = max(_bsm_put(mid_price, K, iv, T), 0.01)
+        for opt_type, leg_price in (("CALL", call_price), ("PUT", put_price)):
             orders.append(Order(
-                order_id="", option_type=opt_type, strike=signal.strike,
+                order_id="", option_type=opt_type, strike=K,
                 side=OrderSide.BUY, quantity=signal.position_size,
                 price=leg_price, **common,
             ))
 
     elif signal.signal_type == SignalType.STRANGLE:
-        # Buy OTM call (strike + 5%) + OTM put (strike - 5%).
-        ep = signal.metadata.get("entry_premium", mid_price * 0.01)
-        leg_price = max(ep * 0.40, 0.01)  # OTM ≈ 40% of ATM premium per leg
+        # Buy OTM call (strike+5%) + OTM put (strike-5%) — price with BSM.
+        iv = max(signal.metadata.get("implied_vol", 0.20), 0.01)
+        try:
+            exp_dt = datetime.strptime(signal.expiry, "%Y-%m-%d")
+            T = max((exp_dt - signal.timestamp.replace(tzinfo=None)).days, 1) / 365.0
+        except Exception:
+            T = 28 / 365.0
+        K_c = signal.strike * 1.05
+        K_p = signal.strike * 0.95
         orders.append(Order(
-            order_id="", option_type="CALL", strike=signal.strike * 1.05,
+            order_id="", option_type="CALL", strike=K_c,
             side=OrderSide.BUY, quantity=signal.position_size,
-            price=leg_price, **common,
+            price=max(_bsm_call(mid_price, K_c, iv, T), 0.01), **common,
         ))
         orders.append(Order(
-            order_id="", option_type="PUT", strike=signal.strike * 0.95,
+            order_id="", option_type="PUT", strike=K_p,
             side=OrderSide.BUY, quantity=signal.position_size,
-            price=leg_price, **common,
+            price=max(_bsm_put(mid_price, K_p, iv, T), 0.01), **common,
         ))
 
     elif signal.signal_type == SignalType.IRON_CONDOR:
         # Short call spread (sell 2% OTM / buy 7% OTM) +
         # short put spread  (sell 2% OTM / buy 7% OTM).
-        #
-        # Approximate leg pricing from Bachelier ATM premium (entry_premium):
-        #   2% OTM short leg ≈ 35% of ATM straddle premium per side
-        #   7% OTM long  leg ≈ 15% of ATM straddle premium per side
-        # Net credit ≈ 2*(35%-15%) = 40% of ATM straddle.
-        ep = signal.metadata.get("entry_premium", mid_price * 0.01)
-        sell_leg_price = max(ep * 0.35, 0.01)
-        buy_leg_price  = max(ep * 0.15, 0.01)
-        for opt_type, sell_strike, buy_strike in [
-            ("CALL", signal.strike * 1.02, signal.strike * 1.07),
-            ("PUT",  signal.strike * 0.98, signal.strike * 0.93),
+        # Each leg priced with BSM using the entry IV and DTE so that
+        # portfolio entry_price = actual option market value.
+        iv = max(signal.metadata.get("implied_vol", 0.20), 0.01)
+        try:
+            exp_dt = datetime.strptime(signal.expiry, "%Y-%m-%d")
+            T = max((exp_dt - signal.timestamp.replace(tzinfo=None)).days, 1) / 365.0
+        except Exception:
+            T = 42 / 365.0
+        S = mid_price
+        K_sc = signal.strike * 1.02
+        K_lc = signal.strike * 1.07
+        K_sp = signal.strike * 0.98
+        K_lp = signal.strike * 0.93
+        sc_price = max(_bsm_call(S, K_sc, iv, T), 0.01)
+        lc_price = max(_bsm_call(S, K_lc, iv, T), 0.01)
+        sp_price = max(_bsm_put(S, K_sp, iv, T), 0.01)
+        lp_price = max(_bsm_put(S, K_lp, iv, T), 0.01)
+        for opt_type, sell_strike, sell_price, buy_strike, buy_price in [
+            ("CALL", K_sc, sc_price, K_lc, lc_price),
+            ("PUT",  K_sp, sp_price, K_lp, lp_price),
         ]:
             orders.append(Order(
                 order_id="", option_type=opt_type, strike=sell_strike,
                 side=OrderSide.SELL, quantity=signal.position_size,
-                price=sell_leg_price, **common,
+                price=sell_price, **common,
             ))
             orders.append(Order(
                 order_id="", option_type=opt_type, strike=buy_strike,
                 side=OrderSide.BUY, quantity=signal.position_size,
-                price=buy_leg_price, **common,
+                price=buy_price, **common,
             ))
 
     elif signal.signal_type == SignalType.CLOSE_POSITION:

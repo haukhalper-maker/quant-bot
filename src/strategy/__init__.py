@@ -21,6 +21,7 @@ from abc import ABC, abstractmethod
 
 import numpy as np
 from loguru import logger
+from scipy.stats import norm as _norm
 
 
 # ============================================================================
@@ -318,12 +319,68 @@ class VolatilityMeanReversionStrategy(Strategy):
 
     @staticmethod
     def _atm_premium(spot: float, iv: float, dte: float) -> float:
-        """
-        Bachelier ATM approximation: premium ≈ 0.4 * S * IV * sqrt(T).
-        T = DTE / 365 (calendar-day basis).
-        """
+        """Bachelier ATM approximation: 0.4 * S * IV * sqrt(T). Used for quick estimates."""
         t = max(dte, 1) / 365.0
         return 0.40 * spot * iv * (t ** 0.5)
+
+    @staticmethod
+    def _bsm_call(S: float, K: float, sigma: float, T: float) -> float:
+        """Black-Scholes call price (r=0 for simplicity)."""
+        if T <= 1e-6:
+            return max(S - K, 0.0)
+        sq = sigma * T ** 0.5
+        d1 = (np.log(S / K) + 0.5 * sigma ** 2 * T) / sq
+        d2 = d1 - sq
+        return float(S * _norm.cdf(d1) - K * _norm.cdf(d2))
+
+    @staticmethod
+    def _bsm_put(S: float, K: float, sigma: float, T: float) -> float:
+        """Black-Scholes put price via put-call parity (r=0)."""
+        if T <= 1e-6:
+            return max(K - S, 0.0)
+        sq = sigma * T ** 0.5
+        d1 = (np.log(S / K) + 0.5 * sigma ** 2 * T) / sq
+        d2 = d1 - sq
+        return float(K * _norm.cdf(-d2) - S * _norm.cdf(-d1))
+
+    @classmethod
+    def _condor_net_value(cls, S: float, entry_spot: float, iv: float, T: float) -> float:
+        """
+        Net market value of the 2%/7% OTM iron condor (cost to close).
+
+        Structure (strikes fixed at entry):
+          Short call  entry_spot × 1.02   Short put  entry_spot × 0.98
+          Long  call  entry_spot × 1.07   Long  put  entry_spot × 0.93
+
+        Positive return = current cost to close (rising = condor losing money).
+        At entry this equals the net credit received.
+
+        Using CURRENT implied_vol (sigma) so IV expansion is properly priced:
+          - Vol spike 15% → 85%: condor value ≫ entry credit → stop loss fires
+          - Deep spot move: short put/call goes ITM → condor value spikes → stop loss fires
+          - Normal theta decay: condor value decays → take profit at 21 DTE
+        """
+        K_sc = entry_spot * 1.02
+        K_lc = entry_spot * 1.07
+        K_sp = entry_spot * 0.98
+        K_lp = entry_spot * 0.93
+        sigma = max(iv, 0.01)
+        Tf = max(T, 1e-6)
+        sc = cls._bsm_call(S, K_sc, sigma, Tf)
+        lc = cls._bsm_call(S, K_lc, sigma, Tf)
+        sp = cls._bsm_put(S, K_sp, sigma, Tf)
+        lp = cls._bsm_put(S, K_lp, sigma, Tf)
+        return sc + sp - lc - lp   # net cost to close (buy shorts, sell longs)
+
+    @classmethod
+    def _straddle_value(cls, S: float, K: float, iv: float, T: float) -> float:
+        """
+        BSM ATM straddle value (call + put at strike K).
+        Used for marking long straddle positions using CURRENT vol.
+        """
+        sigma = max(iv, 0.01)
+        Tf = max(T, 1e-6)
+        return cls._bsm_call(S, K, sigma, Tf) + cls._bsm_put(S, K, sigma, Tf)
 
     @staticmethod
     def _dte(expiry_str: str, ref: datetime) -> float:
@@ -351,22 +408,32 @@ class VolatilityMeanReversionStrategy(Strategy):
             pos_type: str = pos["type"]
             entry_premium: float = pos.get("entry_premium", 0.0)
             expiry_str: str = pos.get("expiry", "")
-            # Use the IV observed at entry — not the current AR(1) simulation value.
-            # This makes current_premium track theta decay + spot movement only,
-            # without spurious noise from the simulated IV process triggering
-            # false stop-losses or premature take-profits.
+            entry_spot: float = pos.get("entry_spot", candle.close)
             entry_iv: float = pos.get("entry_iv", implied_vol)
+            signal_type: str = pos.get("signal_type", "iron_condor" if pos_type == "short" else "straddle")
 
             days_held = (now - entry_time).days
             dte = self._dte(expiry_str, now)
+            T_now = max(dte, 0) / 365.0
 
-            # Mark-to-market: Bachelier with FIXED entry_iv, only spot + DTE move.
-            # This correctly captures:
-            #   • theta decay  (DTE decreasing each day)
-            #   • gamma P&L    (spot moving away from/toward strike)
-            # It deliberately ignores AR(1) IV noise so the exit conditions
-            # are driven by actual market moves, not simulated vol randomness.
-            current_premium = self._atm_premium(candle.close, entry_iv, dte)
+            # Mark-to-market using CURRENT implied_vol (not fixed entry_iv).
+            #
+            # Why current vol matters:
+            #   Iron condors: a VIX spike from 15% → 85% makes short legs worth
+            #     far more than the original credit → stop loss fires correctly.
+            #   Straddles: a vol collapse kills long premium → stop fires.
+            #
+            # implied_vol here is candle.implied_vol if the regime/connector set it
+            # (historically accurate for backtests) or AR(1) continuation otherwise.
+            # AR(1) noise is ±0.5% per candle — low enough not to cause false exits.
+            if signal_type == "iron_condor":
+                current_premium = self._condor_net_value(
+                    S=candle.close, entry_spot=entry_spot, iv=implied_vol, T=T_now
+                )
+            else:   # straddle / strangle — ATM at entry strike
+                current_premium = self._straddle_value(
+                    S=candle.close, K=entry_spot, iv=implied_vol, T=T_now
+                )
 
             exit_reason: Optional[str] = None
 
@@ -438,6 +505,9 @@ class VolatilityMeanReversionStrategy(Strategy):
                         "entry_premium": entry_premium,
                         "current_premium": current_premium,
                         "entry_iv": entry_iv,
+                        "current_iv": implied_vol,   # live vol at exit — used for per-leg BSM close pricing
+                        "entry_spot": entry_spot,
+                        "signal_type": signal_type,
                         "reason": exit_reason,
                     },
                 ))
@@ -454,14 +524,16 @@ class VolatilityMeanReversionStrategy(Strategy):
             if conf < self.min_confidence:
                 return None
             expiry = self._next_expiry(weeks_out=4, ref_date=now.date())
-            entry_premium = self._atm_premium(candle.close, implied_vol, 4 * 7)
+            T_entry = (4 * 7) / 365.0
+            entry_premium = self._straddle_value(candle.close, candle.close, implied_vol, T_entry)
             self._last_signal[sym] = now
             self._positions[sym] = {
                 "type": "long",
+                "signal_type": "straddle",
                 "entry_time": now,
                 "entry_iv_pct": iv_pct,
                 "entry_premium": entry_premium,
-                "entry_iv": implied_vol,        # fixed for current_premium calc
+                "entry_iv": implied_vol,
                 "entry_spot": candle.close,
                 "expiry": expiry,
                 "confirmed": False,
@@ -491,14 +563,18 @@ class VolatilityMeanReversionStrategy(Strategy):
             if conf < self.min_confidence:
                 return None
             expiry = self._next_expiry(weeks_out=6, ref_date=now.date())
-            entry_premium = self._atm_premium(candle.close, implied_vol, 6 * 7)
+            T_entry = (6 * 7) / 365.0
+            entry_premium = self._condor_net_value(
+                S=candle.close, entry_spot=candle.close, iv=implied_vol, T=T_entry
+            )
             self._last_signal[sym] = now
             self._positions[sym] = {
                 "type": "short",
+                "signal_type": "iron_condor",
                 "entry_time": now,
                 "entry_iv_pct": iv_pct,
                 "entry_premium": entry_premium,
-                "entry_iv": implied_vol,        # fixed for current_premium calc
+                "entry_iv": implied_vol,
                 "entry_spot": candle.close,
                 "expiry": expiry,
                 "confirmed": False,
