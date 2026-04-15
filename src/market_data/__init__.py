@@ -496,11 +496,14 @@ class TastytradeConnector(DataConnector):
                 for item in resp.json()["data"]["items"]:
                     sym = item.get("symbol", "")
                     self._metrics_cache[sym] = {
+                        # Already a decimal fraction (e.g. "0.1838" = 18.38%)
                         "iv":      _parse_float(item.get("implied-volatility-index"), 0.20),
-                        "iv_rank": _parse_float(item.get("implied-volatility-index-rank"), 50.0),
-                        "iv_pct":  _parse_float(item.get("implied-volatility-percentile"), 50.0),
-                        "hv30":    _parse_float(item.get("historical-volatility-30-day"), 0.15),
-                        "iv30":    _parse_float(item.get("implied-volatility-30-day"), 0.20),
+                        # 0-1 fraction from API (e.g. "0.3725" = 37.25 rank) → ×100 for 0-100 scale
+                        "iv_rank": _parse_float(item.get("implied-volatility-index-rank"), 0.50) * 100,
+                        "iv_pct":  _parse_float(item.get("implied-volatility-percentile"), 0.50) * 100,
+                        # Percentage-point strings from API (e.g. "8.7" = 8.7%) → ÷100 for decimal
+                        "hv30":    _parse_float(item.get("historical-volatility-30-day"), 15.0) / 100,
+                        "iv30":    _parse_float(item.get("implied-volatility-30-day"), 20.0) / 100,
                         "fetched_at": now,
                     }
 
