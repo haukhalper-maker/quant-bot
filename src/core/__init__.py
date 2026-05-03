@@ -280,6 +280,11 @@ class BotConfig:
     llm_temperature: float = 0.1
     llm_min_confidence: float = 0.45  # Reject LLM decisions below this
 
+    # ZeroDTE / intraday
+    account_bp: float = field(default_factory=lambda: float(os.getenv("ACCOUNT_BP", "2500")))
+    max_risk_pct: float = 0.08   # 8% of BP per trade
+    defined_risk: bool = False   # True = iron condors (cash account / PDT restricted)
+
     # Engine
     event_queue_size: int = 10000
     max_workers: int = 4
@@ -300,4 +305,6 @@ def setup_logging(name: str = "quant_bot") -> None:
         rotation="500 MB",
         retention="7 days",
     )
-    logger.add(lambda msg: print(msg, end=""), level="INFO", colorize=True)
+    import sys, io
+    _stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+    logger.add(lambda msg: (_stdout.write(msg), _stdout.flush()), level="INFO", colorize=True)

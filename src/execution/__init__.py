@@ -444,10 +444,8 @@ def signal_to_orders(signal, mid_price: float) -> List[Order]:
         ))
 
     elif signal.signal_type == SignalType.IRON_CONDOR:
-        # Short call spread (sell 2% OTM / buy 7% OTM) +
-        # short put spread  (sell 2% OTM / buy 7% OTM).
-        # Each leg priced with BSM using the entry IV and DTE so that
-        # portfolio entry_price = actual option market value.
+        # Short call spread + short put spread priced with BSM.
+        # Strikes come from signal metadata (GEX-derived), not % offsets.
         iv = max(signal.metadata.get("implied_vol", 0.20), 0.01)
         try:
             exp_dt = datetime.strptime(signal.expiry, "%Y-%m-%d")
@@ -455,10 +453,10 @@ def signal_to_orders(signal, mid_price: float) -> List[Order]:
         except Exception:
             T = 42 / 365.0
         S = mid_price
-        K_sc = signal.strike * 1.02
-        K_lc = signal.strike * 1.07
-        K_sp = signal.strike * 0.98
-        K_lp = signal.strike * 0.93
+        K_sc = float(signal.metadata.get("call_strike",      signal.strike * 1.02))
+        K_lc = float(signal.metadata.get("wing_call_strike", signal.strike * 1.07))
+        K_sp = float(signal.metadata.get("put_strike",       signal.strike * 0.98))
+        K_lp = float(signal.metadata.get("wing_put_strike",  signal.strike * 0.93))
         sc_price = max(_bsm_call(S, K_sc, iv, T), 0.01)
         lc_price = max(_bsm_call(S, K_lc, iv, T), 0.01)
         sp_price = max(_bsm_put(S, K_sp, iv, T), 0.01)
@@ -477,6 +475,39 @@ def signal_to_orders(signal, mid_price: float) -> List[Order]:
                 side=OrderSide.BUY, quantity=signal.position_size,
                 price=buy_price, **common,
             ))
+
+    elif signal.signal_type == SignalType.SELL_STRADDLE:
+        # Sell ATM call + ATM put — IV crush / premium collection play
+        iv = max(signal.metadata.get("implied_vol", 0.20), 0.01)
+        dte = signal.metadata.get("dte", 1)
+        T = max(dte, 0.5) / 365.0
+        K = signal.strike
+        call_price = max(_bsm_call(mid_price, K, iv, T), 0.01)
+        put_price  = max(_bsm_put(mid_price, K, iv, T), 0.01)
+        for opt_type, leg_price in (("CALL", call_price), ("PUT", put_price)):
+            orders.append(Order(
+                order_id="", option_type=opt_type, strike=K,
+                side=OrderSide.SELL, quantity=signal.position_size,
+                price=leg_price, **common,
+            ))
+
+    elif signal.signal_type == SignalType.SELL_STRANGLE:
+        # Sell OTM call + OTM put around a positive-GEX gamma wall (PIN play)
+        iv = max(signal.metadata.get("implied_vol", 0.20), 0.01)
+        dte = signal.metadata.get("dte", 1)
+        T = max(dte, 0.5) / 365.0
+        K_c = signal.metadata.get("call_strike", signal.strike * 1.01)
+        K_p = signal.metadata.get("put_strike", signal.strike * 0.99)
+        orders.append(Order(
+            order_id="", option_type="CALL", strike=K_c,
+            side=OrderSide.SELL, quantity=signal.position_size,
+            price=max(_bsm_call(mid_price, K_c, iv, T), 0.01), **common,
+        ))
+        orders.append(Order(
+            order_id="", option_type="PUT", strike=K_p,
+            side=OrderSide.SELL, quantity=signal.position_size,
+            price=max(_bsm_put(mid_price, K_p, iv, T), 0.01), **common,
+        ))
 
     elif signal.signal_type == SignalType.CLOSE_POSITION:
         # Close signal handled at portfolio level — no order generated here
@@ -524,13 +555,131 @@ class AlpacaExecutor(ExecutionEngine):
 
 class TastytradeExecutor(ExecutionEngine):
     """
-    [API: Tastytrade API — options order placement]
-    Requires: tastytrade>=1.0.0
-    Docs: https://developer.tastytrade.com/
+    Live order placement via the Tastytrade REST API.
+
+    Requires an authenticated TastytradeConnector — pass the connector
+    after calling connector.connect() so this class can reuse its
+    httpx session and session token.
+
+    Order format (Tastytrade v1):
+      POST /accounts/{account_number}/orders
+      {
+        "order-type": "Market",
+        "time-in-force": "Day",
+        "legs": [
+          {
+            "instrument-type": "Equity Option",
+            "symbol": "SPY   241015C00530000",   ← OCC symbol
+            "quantity": 2,
+            "action": "Buy to Open"              ← or "Sell to Open"
+          }
+        ]
+      }
+
+    OCC symbol format: underlying (6 chars padded) + YYMMDD + C/P + strike*1000 (8 digits)
+    e.g. SPY at $530 call expiring 2024-10-15:  SPY   241015C00530000
     """
 
+    _BASE = "https://api.tastytrade.com"
+
+    def __init__(self, connector=None, account_number: str = None, paper: bool = True):
+        """
+        connector      : TastytradeConnector (authenticated)
+        account_number : override account; defaults to first account on connector
+        paper          : if True, log orders but don't actually submit (safety net)
+        """
+        super().__init__("TastytradeExecutor")
+        self._connector   = connector
+        self._account_num = account_number
+        self.paper        = paper
+
+    # ── helpers ──────────────────────────────────────────────────────────
+
+    def _account(self) -> str:
+        if self._account_num:
+            return self._account_num
+        if self._connector and self._connector._accounts:
+            return self._connector._accounts[0].get("account-number", "")
+        raise RuntimeError("No Tastytrade account number available.")
+
+    @staticmethod
+    def _occ_symbol(symbol: str, expiry: str, option_type: str, strike: float) -> str:
+        """Build the OCC option symbol Tastytrade expects."""
+        # Underlying padded to 6 chars
+        und = symbol.upper().ljust(6)
+        # Expiry YYMMDD
+        try:
+            from datetime import datetime as _dt
+            exp = _dt.strptime(expiry, "%Y-%m-%d").strftime("%y%m%d")
+        except Exception:
+            exp = expiry.replace("-", "")[2:]   # best-effort fallback
+        cp   = "C" if option_type.upper() in ("CALL", "C") else "P"
+        stk  = f"{int(strike * 1000):08d}"
+        return f"{und}{exp}{cp}{stk}"
+
+    @staticmethod
+    def _action(side: "OrderSide", existing_position: bool = False) -> str:
+        # For simplicity assume opening new positions always
+        if side == OrderSide.BUY:
+            return "Buy to Open"
+        return "Sell to Open"
+
+    # ── core ─────────────────────────────────────────────────────────────
+
     async def _submit_order(self, order: Order) -> None:
-        raise NotImplementedError(
-            "Tastytrade executor not yet implemented. "
-            "Use tastytrade SDK to POST /accounts/{account_number}/orders."
+        occ = self._occ_symbol(order.symbol, order.expiry, order.option_type, order.strike)
+        body = {
+            "order-type": "Market",
+            "time-in-force": "Day",
+            "legs": [
+                {
+                    "instrument-type": "Equity Option",
+                    "symbol": occ,
+                    "quantity": order.quantity,
+                    "action": self._action(order.side),
+                }
+            ],
+        }
+
+        logger.info(
+            f"[TT] {'PAPER ' if self.paper else ''}ORDER  "
+            f"{order.side.value} {order.quantity}x {occ}  "
+            f"acct={self._account()}"
         )
+
+        if self.paper:
+            # Paper mode: simulate fill at order.price without hitting the API
+            order.status = OrderStatus.ACCEPTED
+            fill = OrderFill(
+                fill_id=self._new_fill_id(),
+                order_id=order.order_id,
+                quantity=order.quantity,
+                price=order.price or 1.0,
+                timestamp=__import__("datetime").datetime.utcnow(),
+                commission=order.quantity * 0.65,
+            )
+            order.add_fill(fill)
+            order.status = OrderStatus.FILLED
+            return
+
+        # Live submission
+        if not self._connector or not self._connector._client:
+            raise RuntimeError("TastytradeConnector is not connected.")
+
+        resp = await self._connector._client.post(
+            f"{self._BASE}/accounts/{self._account()}/orders",
+            json=body,
+        )
+
+        if resp.status_code in (200, 201):
+            data   = resp.json().get("data", {})
+            order_data = data.get("order", {})
+            remote_id  = str(order_data.get("id", ""))
+            order.status = OrderStatus.SUBMITTED
+            logger.info(f"[TT] Order submitted  remote_id={remote_id}  occ={occ}")
+            # Tastytrade fills async — mark accepted; real fill arrives via websocket
+            order.status = OrderStatus.ACCEPTED
+        else:
+            err = resp.text[:300]
+            logger.error(f"[TT] Order rejected  HTTP {resp.status_code}: {err}")
+            order.status = OrderStatus.REJECTED

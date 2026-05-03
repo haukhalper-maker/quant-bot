@@ -41,72 +41,74 @@ class MarketRegime(Enum):
 _REGIME_PARAMS: Dict[str, dict] = {
     # ── CALM BULL ─────────────────────────────────────────────────────────────
     # Low realized vol, IV/RV structurally > 1.3 — ideal condor environment.
-    # Loosen thresholds: enter more often, hold to 50% profit.
+    # Primary edge: sell condors (IV premium capture). Allow straddle buys only
+    # when IV/RV drops below 1.0 (genuinely cheap vol), gated by heuristic.
     "calm_bull": {
-        "sell_threshold":  68.0,   # sell condors when IV%ile > 68 (was 75)
-        "buy_threshold":   32.0,
-        "iv_rv_sell_min":  1.30,   # only need IV/RV > 1.3x to sell
-        "iv_rv_buy_max":   1.25,
+        "sell_threshold":  65.0,   # sell condors when IV%ile > 65
+        "buy_threshold":   28.0,   # regime pre-filter; heuristic tightens to iv_rv < 1.10
+        "iv_rv_sell_min":  1.30,   # regime pre-filter; heuristic tightens to iv_rv > 1.45
+        "iv_rv_buy_max":   1.15,
         "take_profit_pct": 0.50,
         "stop_loss_mult":  2.00,
-        "min_interval_h":  20,
-        "capital_pct":     0.030,  # 3% of capital per trade — plenty of edge here
+        "min_interval_h":  18,
+        "capital_pct":     0.040,  # 4% — this is the money regime
         "min_contracts":   2,
     },
     # ── ELEVATED VOL ──────────────────────────────────────────────────────────
-    # Choppy/uncertain. IV/RV less reliable. Require stronger signal.
+    # VIX 27-30. IV still rich vs RV but underlying is choppier.
+    # Sell at tighter threshold; allow vol buys when IV/RV < 1.0.
     "elevated_vol": {
-        "sell_threshold":  76.0,
-        "buy_threshold":   24.0,
-        "iv_rv_sell_min":  1.55,
-        "iv_rv_buy_max":   1.10,
-        "take_profit_pct": 0.40,   # take profit faster
-        "stop_loss_mult":  1.75,   # tighter stop — don't let elevated vol hurt you
-        "min_interval_h":  30,
-        "capital_pct":     0.020,  # 2% — more uncertain, reduce exposure
+        "sell_threshold":  73.0,
+        "buy_threshold":   22.0,
+        "iv_rv_sell_min":  1.45,
+        "iv_rv_buy_max":   1.00,   # only buy if IV actually flat/below realized vol
+        "take_profit_pct": 0.40,
+        "stop_loss_mult":  1.75,
+        "min_interval_h":  28,
+        "capital_pct":     0.025,
         "min_contracts":   1,
     },
     # ── TRENDING BEAR ─────────────────────────────────────────────────────────
-    # Sustained downtrend, VIX 28-45. Condors lose because spot keeps moving.
-    # Require extreme IV oversell (88th %ile + IV/RV > 1.8) to even consider.
-    # Never sell if IV/RV < 1.0 (market moving faster than IV prices in).
+    # VIX 30-45, sustained downtrend. Condors die in directional markets.
+    # Sell only at extreme premium (88th %ile + IV/RV > 1.8 = vol way overpriced).
+    # Buy straddles when IV is cheap relative to realized movement.
     "trending_bear": {
         "sell_threshold":  88.0,
-        "buy_threshold":   18.0,
+        "buy_threshold":   22.0,
         "iv_rv_sell_min":  1.80,
-        "iv_rv_buy_max":   1.00,   # buy only if IV is cheaper than realized vol
-        "take_profit_pct": 0.35,   # grab profits fast before reversal unwinds
-        "stop_loss_mult":  1.50,   # tight — no room for losers in bear markets
-        "min_interval_h":  48,     # very selective entries
-        "capital_pct":     0.010,  # 1% max — brutal environment, stay small
+        "iv_rv_buy_max":   1.05,   # buy when IV hasn't spiked yet
+        "take_profit_pct": 0.45,
+        "stop_loss_mult":  1.50,
+        "min_interval_h":  36,
+        "capital_pct":     0.015,  # 1.5% — stay small in brutal environment
         "min_contracts":   1,
     },
     # ── CRASH ─────────────────────────────────────────────────────────────────
-    # VIX 45+. NEVER sell condors. Only buy straddles.
-    # IV spikes are the position — let them run to 150%+ profit.
+    # VIX 45+. Never sell condors. Buy straddles as IV still cheap vs coming RV.
     "crash": {
         "sell_threshold":  999.0,  # disabled
-        "buy_threshold":   15.0,
+        "buy_threshold":   25.0,
         "iv_rv_sell_min":  999.0,  # disabled
-        "iv_rv_buy_max":   1.30,   # buy when IV overshoots RV slightly — COVID spike
+        "iv_rv_buy_max":   1.30,   # buy when IV hasn't fully spiked yet
         "take_profit_pct": 1.50,   # let crash vol runs pay 2.5x
         "stop_loss_mult":  3.00,
-        "min_interval_h":  12,     # re-enter quickly — crash regimes are fast
-        "capital_pct":     0.008,  # 0.8% — tiny size, outsized leverage in vol
+        "min_interval_h":  10,
+        "capital_pct":     0.012,
         "min_contracts":   1,
     },
     # ── RECOVERY ──────────────────────────────────────────────────────────────
-    # Vol falling from elevated levels. Good for condors once IV/RV > 1.4.
+    # Vol falling from elevated levels. Sweet spot for condor selling.
+    # Also allow straddle buys on extreme cheapness — recovery can stall and re-spike.
     "recovery": {
-        "sell_threshold":  72.0,
-        "buy_threshold":   28.0,
-        "iv_rv_sell_min":  1.40,
-        "iv_rv_buy_max":   1.20,
-        "take_profit_pct": 0.45,
+        "sell_threshold":  68.0,
+        "buy_threshold":   25.0,
+        "iv_rv_sell_min":  1.35,
+        "iv_rv_buy_max":   1.05,
+        "take_profit_pct": 0.50,
         "stop_loss_mult":  1.75,
-        "min_interval_h":  24,
-        "capital_pct":     0.020,  # 2% — vol falling is good but stay measured
-        "min_contracts":   1,
+        "min_interval_h":  20,
+        "capital_pct":     0.035,  # 3.5% — recovery is the sweet spot for selling
+        "min_contracts":   2,
     },
 }
 
@@ -123,6 +125,8 @@ class SignalType(Enum):
     SELL_PUT = "sell_put"
     STRADDLE = "straddle"
     STRANGLE = "strangle"
+    SELL_STRADDLE = "sell_straddle"
+    SELL_STRANGLE = "sell_strangle"
     IRON_CONDOR = "iron_condor"
     BUTTERFLY = "butterfly"
     CALENDAR_SPREAD = "calendar_spread"
@@ -400,13 +404,16 @@ class VolatilityMeanReversionStrategy(Strategy):
         if implied_vol >= 0.45:
             return MarketRegime.CRASH
 
-        if implied_vol >= 0.28 and (momentum_20d < -0.04 or iv_rv < 1.05):
+        if implied_vol >= 0.30 and (momentum_20d < -0.05 or iv_rv < 1.05):
             return MarketRegime.TRENDING_BEAR
 
         if iv_was_high and iv_falling and implied_vol >= 0.20:
             return MarketRegime.RECOVERY
 
-        if implied_vol >= 0.22 or iv_rv < 1.15:
+        # Raised from 0.22 → 0.27: VIX 22-27 is normal chop, not truly "elevated".
+        # Also removed the iv_rv < 1.15 catch-all — it was misclassifying calm days
+        # where IV happens to be close to RV.
+        if implied_vol >= 0.27:
             return MarketRegime.ELEVATED_VOL
 
         return MarketRegime.CALM_BULL
@@ -724,7 +731,7 @@ class VolatilityMeanReversionStrategy(Strategy):
         regime          = self._detect_market_regime(sym, implied_vol, iv_rv)
 
         # --- BUY vol: IV is cheap relative to regime ---
-        if iv_pct < buy_threshold and iv_rv < iv_rv_buy_max and not pos and not self._positions.get(sym):
+        if buy_threshold > 0 and iv_pct < buy_threshold and iv_rv < iv_rv_buy_max and not pos and not self._positions.get(sym):
             conf = (buy_threshold - iv_pct) / max(buy_threshold, 1.0)
             if conf < self.min_confidence:
                 return None
@@ -767,7 +774,7 @@ class VolatilityMeanReversionStrategy(Strategy):
             ))
 
         # --- SELL vol: IV is rich relative to regime ---
-        if iv_pct > sell_threshold and iv_rv > iv_rv_sell_min and not pos and not self._positions.get(sym):
+        if sell_threshold < 999 and iv_pct > sell_threshold and iv_rv > iv_rv_sell_min and not pos and not self._positions.get(sym):
             conf = (iv_pct - sell_threshold) / max(100 - sell_threshold, 1.0)
             if conf < self.min_confidence:
                 return None
@@ -1509,8 +1516,1173 @@ class RuleEngine:
             recent_iv_history=recent_ivs,
             volume_poc=vol_poc,
             existing_positions=existing,
+            market_regime=signal.metadata.get("market_regime"),
         )
 
 
 # Back-compat alias
 GammaScalping = GammaScalpingStrategy
+
+
+# ============================================================================
+# ZERO-DTE STRATEGY
+# ============================================================================
+
+
+class PlayType(Enum):
+    PIN       = "pin"        # Sell strangle around positive-GEX wall
+    EXPLOSIVE = "explosive"  # Buy straddle / direction on negative-GEX breakout
+    IV_CRUSH  = "iv_crush"   # Sell ATM straddle to capture elevated 0DTE IV
+
+
+class TimeRegime(Enum):
+    AVOID  = "avoid"   # 9:30–9:50 — let opening settle
+    OPEN   = "open"    # 9:50–10:30 — IV crush + explosive plays
+    MIDDAY = "midday"  # 10:30–13:30 — only very high conviction
+    CLOSE  = "close"   # 13:30–15:55 — all plays, peak gamma activity
+    CLOSED = "closed"  # after 15:55 — no new trades
+
+
+@dataclass
+class ConditionScores:
+    """
+    Eight weighted conditions for 0DTE setup quality.
+    Weighted average ≥ 0.65 → entry.
+    """
+    gamma_wall_quality: float = 0.0   # 2.0× weight — is there a real GEX wall?
+    strike_confluence:  float = 0.0   # 1.5× — GEX + volume + OI all at same strike
+    iv_term_structure:  float = 0.0   # 1.0× — IV edge for the play type
+    price_velocity:     float = 0.0   # 1.0× — price decelerating (pin) / accelerating (explosive)
+    volume_surge:       float = 0.0   # 1.0× — unusual options volume at the wall strike
+    delta_flow:         float = 0.0   # 1.0× — net delta flow direction aligns with play
+    time_regime:        float = 0.0   # 0.5× — time of day allows this play
+    risk_headroom:      float = 0.0   # 0.5× — sufficient BP, not at position limit
+
+    _W = {
+        "gamma_wall_quality": 2.0,
+        "strike_confluence":  1.5,
+        "iv_term_structure":  1.0,
+        "price_velocity":     1.0,
+        "volume_surge":       1.0,
+        "delta_flow":         1.0,
+        "time_regime":        0.5,
+        "risk_headroom":      0.5,
+    }
+
+    @property
+    def weighted_score(self) -> float:
+        total_w = sum(self._W.values())  # 8.5
+        return sum(getattr(self, k) * v for k, v in self._W.items()) / total_w
+
+    def to_dict(self) -> dict:
+        return {k: round(getattr(self, k), 3) for k in self._W}
+
+
+def _gamma_wall_strike(walls: List, spot: float, direction: int, fallback: float = 3.0) -> float:
+    """
+    Return the strike of the highest-gamma wall in the direction of the intended move.
+
+    Gamma walls act as price magnets — buying options at the wall strike lets
+    delta work in our favour as spot is pulled toward the wall.  The wall is
+    naturally OTM (it's above/below spot), so the premium is cheaper than ATM.
+
+    direction: +1 → above spot (calls), -1 → below spot (puts)
+    fallback:  OTM offset if no directional wall exists in the list
+    """
+    if direction > 0:
+        cands = [w for w in walls if w.strike > spot]
+    else:
+        cands = [w for w in walls if w.strike < spot]
+    if cands:
+        best = max(cands, key=lambda w: abs(w.net_gex_dollars) * w.confluence_score)
+        return float(best.strike)
+    return round(spot + direction * fallback)
+
+
+class ZeroDTEStrategy(Strategy):
+    """
+    0-1-3 DTE SPY options strategy driven by gamma exposure walls.
+
+    Entry: 8-condition weighted scorer, threshold 0.65.
+    Three play types auto-selected by GEX sign + price behavior:
+      PIN       — positive GEX + deceleration → sell strangle around wall
+      EXPLOSIVE — negative GEX + acceleration → buy straddle / direction
+      IV_CRUSH  — 0DTE IV >> 1DTE IV → sell straddle to capture crush
+
+    DTE is chosen dynamically — whichever expiry has the best edge for the
+    selected play type (from IVTermStructureAnalyzer).
+
+    Sizing: Kelly criterion capped at 8% of account BP.
+    Win rates are calibrated from PredictionLogger (real traded history).
+
+    Self-learning: every setup is logged (traded or not). After ~30 sessions
+    the accuracy calibration improves Kelly sizing automatically.
+    """
+
+    ENTRY_THRESHOLD = 0.65
+
+    def __init__(
+        self,
+        account_bp: float = 2500.0,
+        risk_pct: float = 0.18,
+        r: float = 0.05,
+        prediction_logger=None,  # PredictionLogger | None
+        defined_risk: bool = False,  # True = iron condor (wings), False = naked strangle
+    ):
+        super().__init__("ZeroDTE")
+        self.account_bp = account_bp
+        self.risk_pct = risk_pct
+        self.r = r
+        self.prediction_logger = prediction_logger
+        self.defined_risk = defined_risk
+
+        self._price_history: List[float] = []
+        self._active_pred_ids: Dict[str, int] = {}
+        self._open_play: Optional[dict] = None
+        self._vol_hist_per_strike: Dict[float, List[int]] = {}
+        self._gap_pct: float = 0.0      # today's gap vs prior close (set each morning)
+        self._prior_close: float = 0.0  # prior day close
+
+        # Intraday order flow proxy — reset each day
+        self._cum_delta:    float = 0.0   # cumulative volume-weighted bar direction
+        self._cum_abs_vol:  float = 0.0   # total absolute volume for normalisation
+        self._vix:          float = 18.0  # today's VIX level (set each morning)
+
+    def set_daily_context(
+        self, gap_pct: float, prior_close: float = 0.0, vix: float = 18.0
+    ) -> None:
+        """Call once before market open each day with gap info."""
+        self._gap_pct     = gap_pct
+        self._prior_close = prior_close
+        self._vix         = vix
+        self._cum_delta   = 0.0
+        self._cum_abs_vol = 0.0
+
+    # ------------------------------------------------------------------ #
+    # Abstract interface                                                    #
+    # ------------------------------------------------------------------ #
+
+    async def on_tick(self, tick) -> Optional[Signal]:
+        return None
+
+    async def on_candle(self, candle) -> Optional[Signal]:
+        return None
+
+    async def on_greek_update(self, greeks) -> Optional[Signal]:
+        return None
+
+    # ------------------------------------------------------------------ #
+    # Main intraday entry point                                            #
+    # ------------------------------------------------------------------ #
+
+    async def on_bar(
+        self,
+        candle,                         # Candle
+        walls: List,                    # List[GammaWall]
+        term_analyses: List,            # List[DTEAnalysis]
+        available_bp: float,
+    ) -> Optional[Signal]:
+        """Called every 1-minute bar with fresh GEX + IV data."""
+        spot = candle.close
+        now  = candle.timestamp
+
+        self._price_history.append(spot)
+        if len(self._price_history) > 40:
+            self._price_history = self._price_history[-40:]
+
+        # Accumulate intraday order flow proxy each bar
+        bar_move = candle.close - candle.open
+        vol = float(candle.volume) if candle.volume else 1.0
+        self._cum_delta   += bar_move * vol
+        self._cum_abs_vol += abs(bar_move) * vol
+
+        regime = self._time_regime(now)
+        if regime in (TimeRegime.AVOID, TimeRegime.CLOSED):
+            return None
+
+        if not walls or not term_analyses:
+            return None
+
+        # Pick best wall: highest GEX × confluence within distance
+        best_wall = max(walls, key=lambda w: abs(w.net_gex_dollars) * w.confluence_score)
+
+        # Select play type and DTE
+        play_type, best_dte = self._select_play(best_wall, spot, regime, term_analyses)
+        if best_dte is None:
+            return None
+
+        # Score all 8 conditions
+        scores = self._score(best_wall, spot, play_type, regime, best_dte, available_bp)
+        ws = scores.weighted_score
+
+        logger.debug(
+            f"[ZeroDTE] {play_type.value}  K={best_wall.strike:.1f}  "
+            f"score={ws:.3f}  {scores.to_dict()}"
+        )
+
+        # Log prediction regardless of entry decision
+        pred_low  = spot - best_dte.expected_move_1sd
+        pred_high = spot + best_dte.expected_move_1sd
+        outcome_label = (
+            "pin"      if play_type == PlayType.PIN else
+            "crush"    if play_type == PlayType.IV_CRUSH else
+            ("break_up" if self._velocity() > 0 else "break_down")
+        )
+
+        pred = SetupPrediction(
+            timestamp=now,
+            symbol=candle.symbol,
+            wall_strike=best_wall.strike,
+            spot_price=spot,
+            dte=best_dte.dte,
+            net_gex_dollars=best_wall.net_gex_dollars,
+            confluence_score=best_wall.confluence_score,
+            play_type=play_type.value,
+            predicted_outcome=outcome_label,
+            predicted_low=pred_low,
+            predicted_high=pred_high,
+            condition_score=ws,
+            traded=(ws >= self.ENTRY_THRESHOLD),
+        )
+
+        pred_id = 0
+        if self.prediction_logger:
+            pred_id = self.prediction_logger.log(pred)
+            self._active_pred_ids[candle.symbol] = pred_id
+
+        if ws < self.ENTRY_THRESHOLD:
+            return None
+
+        # Kelly sizing — use empirical priors until prediction_logger accumulates history.
+        # PIN prior = 0.80 (conservative vs observed 85-93%); EXPLOSIVE never trades.
+        _play_priors = {
+            PlayType.PIN:       0.80,
+            PlayType.IV_CRUSH:  0.70,
+            PlayType.EXPLOSIVE: 0.45,
+        }
+        win_rate = _play_priors.get(play_type, 0.60)
+        if self.prediction_logger:
+            calibrated = self.prediction_logger.get_calibrated_win_rate(play_type.value)
+            if calibrated and calibrated > 0.50:
+                win_rate = calibrated
+
+        # Estimate ATM premium for sizing
+        T = max(best_dte.dte, 0.25) / 365.0
+        atm_premium = best_dte.atm_iv * spot * float(np.sqrt(T)) * 0.4
+
+        n_contracts = self._kelly_contracts(
+            premium=max(atm_premium, 0.50),
+            play_type=play_type,
+            win_rate=win_rate,
+        )
+
+        # Strike selection per play type
+        target_reasoning = ""
+        wing_call = wing_put = 0  # only used by EXPLOSIVE iron condor
+
+        if play_type == PlayType.PIN:
+            offset = max(2.0, best_dte.expected_move_1sd * 0.3)
+            call_k       = round(best_wall.strike + offset)
+            put_k        = round(best_wall.strike - offset)
+            sig_type     = SignalType.IRON_CONDOR if self.defined_risk else SignalType.SELL_STRANGLE
+            entry_strike = best_wall.strike
+
+        elif play_type == PlayType.EXPLOSIVE:
+            # PIN-only mode: skip high-vol days rather than buying premium.
+            # ATM straddles require actual move > implied move (~35% probability)
+            # which is negative EV. Sitting out beats losing consistently.
+            return None
+
+        else:  # IV_CRUSH
+            sig_type     = SignalType.SELL_STRADDLE
+            entry_strike = round(spot)
+            call_k = put_k = round(spot)
+
+        return self._emit(Signal(
+            signal_type=sig_type,
+            symbol=candle.symbol,
+            timestamp=now,
+            strike=entry_strike,
+            expiry=best_dte.expiry,
+            confidence=ws,
+            position_size=n_contracts,
+            strategy_name=self.name,
+            metadata={
+                "play_type":         play_type.value,
+                "wall_strike":       best_wall.strike,
+                "wall_type":         best_wall.wall_type,
+                "net_gex_dollars":   best_wall.net_gex_dollars,
+                "confluence_score":  best_wall.confluence_score,
+                "condition_score":   ws,
+                "conditions":        scores.to_dict(),
+                "dte":               best_dte.dte,
+                "expiry":            best_dte.expiry,
+                "implied_vol":       best_dte.atm_iv,
+                "expected_move":     best_dte.expected_move_1sd,
+                "call_strike":       call_k,
+                "put_strike":        put_k,
+                "wing_call_strike":  wing_call if play_type == PlayType.EXPLOSIVE else call_k + 5,
+                "wing_put_strike":   wing_put  if play_type == PlayType.EXPLOSIVE else put_k  - 5,
+                "target_reasoning":  target_reasoning,
+                "kelly_contracts":   n_contracts,
+                "win_rate_used":     win_rate,
+                "time_regime":       regime.value,
+                "prediction_id":     pred_id,
+            },
+        ))
+
+    def on_expiry_resolution(self, symbol: str, actual_price: float, pnl: Optional[float] = None) -> None:
+        """Call at option expiry to resolve predictions and improve calibration."""
+        pred_id = self._active_pred_ids.pop(symbol, None)
+        if pred_id and self.prediction_logger:
+            self.prediction_logger.resolve(pred_id, actual_price, pnl)
+
+    # ------------------------------------------------------------------ #
+    # Internal helpers                                                      #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _time_regime(now: datetime) -> TimeRegime:
+        """Map UTC datetime to market-time regime (ET = UTC-4 EDT / UTC-5 EST)."""
+        # Approximate DST: EDT (UTC-4) Mar 2nd Sun → Nov 1st Sun; else EST (UTC-5).
+        # Good enough for intraday trading without pytz dependency.
+        import calendar
+        y, mo, d = now.year, now.month, now.day
+        # Find second Sunday of March and first Sunday of November
+        def _nth_sunday(year: int, month: int, n: int) -> int:
+            first_day = calendar.weekday(year, month, 1)  # 0=Mon
+            first_sun = (6 - first_day) % 7 + 1          # day-of-month of 1st Sunday
+            return first_sun + 7 * (n - 1)
+        dst_start = _nth_sunday(y, 3, 2)   # 2nd Sun March
+        dst_end   = _nth_sunday(y, 11, 1)  # 1st Sun November
+        in_edt = (mo > 3 or (mo == 3 and d >= dst_start)) and \
+                 (mo < 11 or (mo == 11 and d < dst_end))
+        offset_h = 4 if in_edt else 5
+        et_hour = (now.hour - offset_h) % 24
+        m = et_hour * 60 + now.minute
+        if m < 9 * 60 + 50:
+            return TimeRegime.AVOID
+        if m < 10 * 60 + 30:
+            return TimeRegime.OPEN
+        if m < 13 * 60 + 30:
+            return TimeRegime.MIDDAY
+        if m < 15 * 60 + 55:
+            return TimeRegime.CLOSE
+        return TimeRegime.CLOSED
+
+    def _velocity(self) -> float:
+        """Recent price velocity (fraction per bar). Positive = moving up."""
+        p = self._price_history
+        if len(p) < 4:
+            return 0.0
+        return (p[-1] - p[-4]) / max(p[-4], 1.0)
+
+    def _deceleration(self) -> float:
+        """Positive = price slowing down (good for pin)."""
+        p = self._price_history
+        if len(p) < 8:
+            return 0.0
+        v_recent = abs(p[-1] - p[-4]) / max(p[-4], 1.0)
+        v_prior  = abs(p[-5] - p[-8]) / max(p[-8], 1.0)
+        return (v_prior - v_recent) / max(v_prior, 1e-6)
+
+    def _select_play(
+        self,
+        wall,              # GammaWall
+        spot: float,
+        regime: TimeRegime,
+        term_analyses: List,
+    ) -> tuple:
+        """Return (PlayType, DTEAnalysis) for the best play given the wall."""
+        from src.analysis import IVTermStructureAnalyzer
+        analyzer = IVTermStructureAnalyzer()
+
+        # Hard VIX gate: above 28 dealers are short gamma and SPY won't pin.
+        # Sell-strangle risk/reward collapses — skip entirely regardless of GEX sign.
+        if self._vix >= 28:
+            return None, None
+
+        dte0 = next((a for a in term_analyses if a.dte == 0), None)
+        vel  = self._velocity()
+
+        # 1. EXPLOSIVE — checked first so momentum plays aren't blocked by IV_CRUSH.
+        #    Triggers on: negative GEX (dealers short gamma → explosive moves), OR
+        #    strong intrabar momentum (0.15%+ per bar regardless of GEX sign).
+        #    Requires VIX > 28: at moderate vol, OTM premiums can't overcome theta
+        #    unless the market delivers a real move (>1%). Below VIX 28, "explosive"
+        #    GEX triggers on normal chop and the edge collapses.
+        is_neg_gex       = wall.net_gex_dollars < -200_000
+        is_strong_move   = abs(vel) > 0.0015   # 0.15% per bar ≈ $0.80 SPY move
+        if (is_neg_gex or is_strong_move) and self._vix >= 28:
+            best = analyzer.select_best_dte(term_analyses, "explosive")
+            if best:
+                return PlayType.EXPLOSIVE, best
+
+        # 2. IV_CRUSH — only when 0DTE crush_probability is genuinely elevated
+        #    (not just "0DTE IV > 1DTE IV" which is almost always true on SPY).
+        if (
+            dte0 and dte0.crush_probability > 0.30
+            and regime in (TimeRegime.OPEN, TimeRegime.CLOSE)
+        ):
+            return PlayType.IV_CRUSH, dte0
+
+        # 3. PIN — positive GEX with price decelerating into wall (magnet effect)
+        if wall.net_gex_dollars > 200_000 and self._deceleration() > 0.03:
+            best = analyzer.select_best_dte(term_analyses, "pin")
+            if best:
+                return PlayType.PIN, best
+
+        # 4. Default: follow GEX sign (require VIX >= 28 for EXPLOSIVE)
+        if abs(wall.net_gex_dollars) > 200_000:
+            if wall.net_gex_dollars < 0 and self._vix < 28:
+                play = PlayType.PIN  # low vol → pin, not explosive
+            else:
+                play = PlayType.PIN if wall.net_gex_dollars > 0 else PlayType.EXPLOSIVE
+            best = analyzer.select_best_dte(term_analyses, play.value)
+            return play, best or (term_analyses[0] if term_analyses else None)
+
+        return PlayType.PIN, (term_analyses[0] if term_analyses else None)
+
+    def _score(
+        self,
+        wall,
+        spot: float,
+        play_type: PlayType,
+        regime: TimeRegime,
+        dte_analysis,
+        available_bp: float,
+    ) -> ConditionScores:
+        s = ConditionScores()
+
+        # 1. Gamma Wall Quality
+        a = abs(wall.net_gex_dollars)
+        s.gamma_wall_quality = (
+            1.0 if a >= 5_000_000 else
+            0.75 if a >= 2_000_000 else
+            0.50 if a >= 1_000_000 else
+            0.25 if a >= 500_000  else 0.05
+        )
+
+        # 2. Strike Confluence
+        s.strike_confluence = wall.confluence_score
+
+        # 3. IV Term Structure
+        if dte_analysis:
+            if play_type == PlayType.IV_CRUSH:
+                s.iv_term_structure = float(np.clip(dte_analysis.crush_probability * 1.3, 0, 1))
+            elif play_type == PlayType.PIN:
+                s.iv_term_structure = dte_analysis.crush_probability
+            else:  # explosive — high IV means larger potential move
+                s.iv_term_structure = float(np.clip(dte_analysis.atm_iv / 0.25, 0, 1))
+
+        # 4. Price Velocity
+        vel   = self._velocity()
+        decel = self._deceleration()
+        if play_type == PlayType.PIN:
+            s.price_velocity = float(np.clip(decel * 2, 0, 1))
+        elif play_type == PlayType.EXPLOSIVE:
+            s.price_velocity = float(np.clip(abs(vel) * 300, 0, 1))
+        else:  # iv_crush — want stable price
+            s.price_velocity = float(np.clip(1.0 - abs(vel) * 500, 0, 1))
+
+        # 5. Volume Surge at Wall Strike
+        hist = self._vol_hist_per_strike.get(wall.strike, [])
+        avg_vol = float(np.mean(hist)) if hist else max(wall.total_volume * 0.5, 100)
+        s.volume_surge = float(np.clip(wall.total_volume / max(avg_vol, 1) / 2.0, 0, 1))
+
+        # Update history
+        self._vol_hist_per_strike.setdefault(wall.strike, []).append(wall.total_volume)
+        if len(self._vol_hist_per_strike[wall.strike]) > 30:
+            self._vol_hist_per_strike[wall.strike] = self._vol_hist_per_strike[wall.strike][-30:]
+
+        # 6. Delta Flow — call vs put volume balance
+        total = wall.call_volume + wall.put_volume
+        call_ratio = wall.call_volume / max(total, 1)  # 0.5 = balanced
+        imbalance = abs(call_ratio - 0.5) * 2          # 0 = balanced, 1 = all one side
+        if play_type == PlayType.PIN:
+            s.delta_flow = float(np.clip(1.0 - imbalance, 0, 1))
+        elif play_type == PlayType.EXPLOSIVE:
+            direction_ok = (
+                (call_ratio > 0.6 and vel > 0) or  # buying calls + moving up
+                (call_ratio < 0.4 and vel < 0)     # buying puts + moving down
+            )
+            s.delta_flow = 0.80 if direction_ok else 0.40
+        else:
+            s.delta_flow = 0.60
+
+        # 7. Time Regime
+        regime_scores = {
+            TimeRegime.AVOID:  0.0,
+            TimeRegime.OPEN:   1.0,
+            TimeRegime.MIDDAY: 0.70 if play_type == PlayType.EXPLOSIVE else 0.55,
+            TimeRegime.CLOSE:  1.0,
+            TimeRegime.CLOSED: 0.0,
+        }
+        s.time_regime = regime_scores.get(regime, 0.0)
+
+        # 8. Risk Headroom
+        trade_cost = self.account_bp * self.risk_pct
+        s.risk_headroom = (
+            1.0 if available_bp >= trade_cost * 3 else
+            0.80 if available_bp >= trade_cost * 2 else
+            0.50 if available_bp >= trade_cost     else 0.0
+        )
+
+        return s
+
+    def _kelly_contracts(
+        self,
+        premium: float,
+        play_type: PlayType,
+        win_rate: float,
+    ) -> int:
+        """Kelly criterion → contracts, capped at 8% of BP."""
+        # b = reward/risk ratio (profit per unit risked).
+        # 0DTE calls/puts can 3-10x on a strong move → use conservative 2.5x target.
+        # Kelly_f = (p*b - q) / b. At 50% win: PIN=0%, EXPLOSIVE=30%, IV_CRUSH=0% → all clip to 25% max.
+        payoff_map = {
+            PlayType.PIN:      (0.50, 2.0),   # sell strangle: collect credit, risk 2x if blown
+            PlayType.EXPLOSIVE:(2.50, 1.0),   # buy 0DTE: target 2.5x on good move, risk 100% of premium
+            PlayType.IV_CRUSH: (0.40, 2.0),   # sell straddle: collect credit, risk 2x if pin broken
+        }
+        tp_frac, sl_mult = payoff_map[play_type]
+        p, q = win_rate, 1.0 - win_rate
+        b = tp_frac
+        kelly_f = float(np.clip((p * b - q) / b, 0.0, 0.25))
+
+        max_risk    = self.account_bp * self.risk_pct
+        kelly_risk  = kelly_f * self.account_bp
+        risk_dollars = min(max_risk, kelly_risk)
+
+        risk_per_contract = sl_mult * premium * 100
+        if risk_per_contract <= 0:
+            return 1
+
+        n = int(risk_dollars / risk_per_contract)
+        # Hard cap: SPY strangle margin ~$10k/contract; keep liquidity realistic.
+        # Scales with account: $25k→2, $50k→4, $100k→8, $250k→10 (ceiling).
+        liquidity_cap = max(2, min(10, int(self.account_bp / 25_000) * 2))
+        return max(1, min(n, liquidity_cap))
+
+    @staticmethod
+    def _predict_move_target(
+        walls: List,
+        spot: float,
+        direction: int,          # +1 = up, -1 = down
+        expected_move: float,    # 1-sigma expected move from IV
+    ) -> tuple:
+        """
+        Predict the OTM strike to buy on an explosive move.
+
+        Logic:
+          When negative GEX breaks, price accelerates toward the next
+          positive-GEX wall — dealers flip long gamma there and pin price.
+          That wall is the natural target. We buy OTM options at a strike
+          roughly 60% of the way from spot to that wall (cheaper premium,
+          higher payout if target is reached).
+
+          Fallback: if no clear positive wall exists in that direction,
+          use 0.8× the 1-sigma expected move as the OTM distance
+          (slightly inside the market's expected range → better probability).
+
+        Returns (strike: float, reasoning: str)
+        """
+        # Separate positive-GEX walls in the direction of the move
+        if direction > 0:
+            candidates = sorted(
+                [w for w in walls if w.strike > spot + 0.5 and w.net_gex_dollars > 0],
+                key=lambda w: w.strike
+            )
+        else:
+            candidates = sorted(
+                [w for w in walls if w.strike < spot - 0.5 and w.net_gex_dollars > 0],
+                key=lambda w: w.strike, reverse=True
+            )
+
+        if candidates:
+            target_wall = candidates[0]
+            dist = abs(target_wall.strike - spot)
+            # Buy at 60% of the way to the target wall — OTM but within reach
+            otm_offset = max(dist * 0.60, 1.0) * direction
+            otm_strike = round(spot + otm_offset)
+            reasoning = (
+                f"GEX target wall K={target_wall.strike:.0f} "
+                f"(+${target_wall.net_gex_dollars/1e6:.1f}M) "
+                f"{'above' if direction > 0 else 'below'} — "
+                f"buying OTM at {otm_strike} ({dist*0.60:.1f}pts OTM)"
+            )
+            return float(otm_strike), reasoning
+
+        # Fallback: use 0.8× expected move OTM
+        otm_offset = max(expected_move * 0.80, 1.0) * direction
+        otm_strike = round(spot + otm_offset)
+        reasoning = (
+            f"No clear GEX target — using 0.8x expected_move "
+            f"({expected_move:.2f}pts) -> OTM at {otm_strike}"
+        )
+        return float(otm_strike), reasoning
+
+    def seed_iv_history(self, symbol: str, history: List[float]) -> None:
+        pass  # ZeroDTE does not use multi-day IV history seeding
+
+
+# Helper import for SetupPrediction used in on_bar
+try:
+    from src.analysis import SetupPrediction  # noqa: F401
+except ImportError:
+    pass
+
+
+# ============================================================================
+# OPENING RANGE BREAKOUT (ORB)
+# First 30-min high/low defines the range. Break above = buy call.
+# Break below = buy put. Price has momentum committed to a direction.
+# ============================================================================
+
+class ORBStrategy(Strategy):
+    """
+    Opening Range Breakout: first 30-min high/low → trade the break.
+
+    Edge: institutional orders placed at open define daily direction.
+    A clean break of the ORB with volume confirmation = committed move.
+    Buy options just inside the break so you're already slightly ITM on move.
+    """
+
+    CONFIRM_BARS = 2        # bars price must hold above/below ORB before entry
+    MIN_RANGE_PCT = 0.0015  # ORB must be at least 0.15% wide to be meaningful
+    SCORE_THRESHOLD = 0.68  # raised: ORB needs clean decisive break
+
+    def __init__(self, account_bp: float = 2500.0, risk_pct: float = 0.15):
+        super().__init__("ORB")
+        self.account_bp = account_bp
+        self.risk_pct   = risk_pct
+        self._orb_high: Optional[float] = None
+        self._orb_low:  Optional[float] = None
+        self._orb_set:  bool = False
+        self._fired:    bool = False   # one trade per day
+        self._bars_above: int = 0
+        self._bars_below: int = 0
+        self._date: str = ""
+
+    def set_daily_context(self, trade_date: str) -> None:
+        if trade_date != self._date:
+            self._orb_high = None
+            self._orb_low  = None
+            self._orb_set  = False
+            self._fired    = False
+            self._bars_above = 0
+            self._bars_below = 0
+            self._date = trade_date
+
+    async def on_tick(self, tick) -> Optional[Signal]: return None
+    async def on_candle(self, candle) -> Optional[Signal]: return None
+    async def on_greek_update(self, greeks) -> Optional[Signal]: return None
+
+    async def on_bar(
+        self,
+        candle,
+        walls: List,
+        term_analyses: List,
+        available_bp: float,
+        trade_date: str = "",
+    ) -> Optional[Signal]:
+        if trade_date:
+            self.set_daily_context(trade_date)
+        if self._fired or not term_analyses:
+            return None
+
+        spot = candle.close
+        ts   = candle.timestamp
+        # ET hour (UTC-4 EDT approximation)
+        et_h = ts.hour - 4
+        et_m = et_h * 60 + ts.minute
+
+        # Build ORB from 9:30–10:00 ET (first 30 min)
+        if 9 * 60 + 30 <= et_m < 10 * 60:
+            if self._orb_high is None:
+                self._orb_high = candle.high
+                self._orb_low  = candle.low
+            else:
+                self._orb_high = max(self._orb_high, candle.high)
+                self._orb_low  = min(self._orb_low,  candle.low)
+            return None
+
+        # Lock in ORB at 10:00
+        if not self._orb_set and self._orb_high and self._orb_low:
+            rng = (self._orb_high - self._orb_low) / self._orb_low
+            if rng < self.MIN_RANGE_PCT:
+                self._orb_set = True  # too narrow — won't trade today
+                self._fired   = True
+                return None
+            self._orb_set = True
+
+        if not self._orb_set or et_m >= 15 * 60 + 30:
+            return None
+
+        # Count confirmation bars
+        if spot > self._orb_high:
+            self._bars_above += 1
+            self._bars_below  = 0
+        elif spot < self._orb_low:
+            self._bars_below += 1
+            self._bars_above  = 0
+        else:
+            self._bars_above = max(0, self._bars_above - 1)
+            self._bars_below = max(0, self._bars_below - 1)
+            return None
+
+        if self._bars_above < self.CONFIRM_BARS and self._bars_below < self.CONFIRM_BARS:
+            return None
+
+        # Score the setup
+        orb_width  = self._orb_high - self._orb_low
+        breakout   = (spot - self._orb_high) / orb_width if self._bars_above >= self.CONFIRM_BARS \
+                     else (self._orb_low - spot) / orb_width
+        score = float(np.clip(0.55 + breakout * 2.0, 0.0, 1.0))
+        if score < self.SCORE_THRESHOLD:
+            return None
+
+        dte0   = next((a for a in term_analyses if a.dte == 0), term_analyses[0])
+        expiry = dte0.expiry
+
+        # Strike: highest-gamma wall in breakout direction — OTM magnet target
+        if self._bars_above >= self.CONFIRM_BARS:
+            sig_type = SignalType.BUY_CALL
+            strike   = round(_gamma_wall_strike(walls, spot, 1, fallback=3.0))
+            reasoning = f"ORB breakout UP  range={self._orb_low:.1f}-{self._orb_high:.1f}  spot={spot:.1f}  K={strike}"
+        else:
+            sig_type = SignalType.BUY_PUT
+            strike   = round(_gamma_wall_strike(walls, spot, -1, fallback=3.0))
+            reasoning = f"ORB breakdown DOWN  range={self._orb_low:.1f}-{self._orb_high:.1f}  spot={spot:.1f}  K={strike}"
+
+        # Kelly: ORB wins ~55-60% historically when confirmed
+        premium = max(dte0.atm_iv * spot * (0.25 / 365.0) ** 0.5 * 0.4, 0.50)
+        kelly_f = np.clip((0.57 * 2.5 - 0.43) / 2.5, 0.0, 0.25)
+        n = max(1, int(kelly_f * self.account_bp * self.risk_pct / (premium * 100)))
+
+        self._fired = True
+        return Signal(
+            signal_type=sig_type, symbol=candle.symbol, timestamp=candle.timestamp,
+            strike=strike, expiry=expiry, confidence=score, position_size=n,
+            strategy_name=self.name,
+            metadata={"play_type": "orb", "condition_score": score,
+                      "reasoning": reasoning, "dte": dte0.dte,
+                      "call_strike": strike, "put_strike": strike},
+        )
+
+
+# ============================================================================
+# VWAP DEVIATION
+# Price stretched far from VWAP = mean reversion opportunity OR trend signal.
+# VWAP cross with volume = trend confirmation for directional options.
+# ============================================================================
+
+class VWAPStrategy(Strategy):
+    """
+    Two modes:
+    - VWAP cross (price crosses VWAP with vol expansion) → trend continuation
+    - VWAP stretch (>0.5% from VWAP + volume spike) → mean reversion
+
+    VWAP cross is higher-conviction for 0DTE. Reversion used when gap is extreme.
+    """
+
+    STRETCH_PCT   = 0.005   # 0.5% from VWAP to consider stretched
+    VOL_MULT      = 1.5     # volume must be 1.5× avg to confirm cross
+    SCORE_THRESHOLD = 0.82  # max formula score is 0.78 → effectively disabled until score logic is reworked
+
+    def __init__(self, account_bp: float = 2500.0, risk_pct: float = 0.15):
+        super().__init__("VWAP")
+        self.account_bp  = account_bp
+        self.risk_pct    = risk_pct
+        self._cum_pv:    float = 0.0   # cumulative price×volume
+        self._cum_vol:   float = 0.0   # cumulative volume
+        self._vwap:      float = 0.0
+        self._vol_hist:  List[float] = []
+        self._prev_above: Optional[bool] = None  # was price above VWAP last bar?
+        self._fired:     bool = False
+        self._date:      str  = ""
+
+    def set_daily_context(self, trade_date: str) -> None:
+        if trade_date != self._date:
+            self._cum_pv   = 0.0
+            self._cum_vol  = 0.0
+            self._vwap     = 0.0
+            self._vol_hist = []
+            self._prev_above = None
+            self._fired    = False
+            self._date     = trade_date
+
+    async def on_tick(self, tick) -> Optional[Signal]: return None
+    async def on_candle(self, candle) -> Optional[Signal]: return None
+    async def on_greek_update(self, greeks) -> Optional[Signal]: return None
+
+    async def on_bar(
+        self,
+        candle,
+        walls: List,
+        term_analyses: List,
+        available_bp: float,
+        trade_date: str = "",
+    ) -> Optional[Signal]:
+        if trade_date:
+            self.set_daily_context(trade_date)
+        if self._fired or not term_analyses:
+            return None
+
+        spot = candle.close
+        vol  = float(candle.volume) if candle.volume else 1.0
+        typ  = (candle.high + candle.low + candle.close) / 3.0
+
+        # Update VWAP
+        self._cum_pv  += typ * vol
+        self._cum_vol += vol
+        self._vwap     = self._cum_pv / max(self._cum_vol, 1.0)
+        self._vol_hist.append(vol)
+        if len(self._vol_hist) > 20:
+            self._vol_hist.pop(0)
+
+        ts   = candle.timestamp
+        et_m = (ts.hour - 4) * 60 + ts.minute
+        if et_m < 10 * 60 or et_m > 15 * 60 + 30:
+            self._prev_above = spot > self._vwap
+            return None
+
+        avg_vol    = float(np.mean(self._vol_hist)) if self._vol_hist else 1.0
+        dev_pct    = (spot - self._vwap) / self._vwap
+        above_vwap = spot > self._vwap
+        crossed    = (self._prev_above is not None) and (above_vwap != self._prev_above)
+        vol_conf   = vol >= avg_vol * self.VOL_MULT
+
+        self._prev_above = above_vwap
+
+        sig_type = None
+        score    = 0.0
+
+        if crossed and vol_conf:
+            # VWAP cross with volume = trend confirmation
+            sig_type = SignalType.BUY_CALL if above_vwap else SignalType.BUY_PUT
+            score    = float(np.clip(0.63 + min(vol / avg_vol - 1.5, 1.0) * 0.15, 0.0, 1.0))
+        elif abs(dev_pct) > self.STRETCH_PCT and vol_conf:
+            # Extreme stretch: fade back toward VWAP
+            sig_type = SignalType.BUY_PUT if above_vwap else SignalType.BUY_CALL
+            score    = float(np.clip(0.55 + (abs(dev_pct) - self.STRETCH_PCT) * 20, 0.0, 1.0))
+
+        if sig_type is None or score < self.SCORE_THRESHOLD:
+            return None
+
+        dte0   = next((a for a in term_analyses if a.dte == 0), term_analyses[0])
+        _dir   = 1 if sig_type == SignalType.BUY_CALL else -1
+        strike = round(_gamma_wall_strike(walls, spot, _dir, fallback=2.0))
+        premium = max(dte0.atm_iv * spot * (0.25 / 365.0) ** 0.5 * 0.4, 0.50)
+        kelly_f = np.clip((0.55 * 2.5 - 0.45) / 2.5, 0.0, 0.25)
+        n = max(1, int(kelly_f * self.account_bp * self.risk_pct / (premium * 100)))
+
+        self._fired = True
+        return Signal(
+            signal_type=sig_type, symbol=candle.symbol, timestamp=candle.timestamp,
+            strike=strike, expiry=dte0.expiry, confidence=score, position_size=n,
+            strategy_name=self.name,
+            metadata={"play_type": "vwap", "condition_score": score,
+                      "vwap": round(self._vwap, 2), "dev_pct": round(dev_pct * 100, 3),
+                      "crossed": crossed, "dte": dte0.dte,
+                      "call_strike": strike, "put_strike": strike},
+        )
+
+
+# ============================================================================
+# GAP FILL
+# SPY gaps up or down vs prior close. Small gaps (<1%) fill ~70% of the time.
+# Large gaps (>1.5%) often continue. Trade the statistically likely outcome.
+# ============================================================================
+
+class GapFillStrategy(Strategy):
+    """
+    Gap fill: if SPY opens with a gap, bet on whether it fills or continues.
+    - Small gap (0.3-1.0%): fade → buy against the gap direction
+    - Large gap (>1.5%): continuation → buy with the gap direction
+    - Confirm with first 15-min price action before entry
+    """
+
+    SMALL_GAP  = 0.003  # 0.3%
+    LARGE_GAP  = 0.015  # 1.5%
+    SCORE_THRESHOLD = 0.78  # raised: gap-fills need strong confirmation to overcome premium
+
+    def __init__(self, account_bp: float = 2500.0, risk_pct: float = 0.15):
+        super().__init__("GapFill")
+        self.account_bp  = account_bp
+        self.risk_pct    = risk_pct
+        self._gap_pct:   float = 0.0
+        self._prior_close: float = 0.0
+        self._fired:     bool = False
+        self._date:      str  = ""
+
+    def set_daily_context(self, gap_pct: float, prior_close: float, trade_date: str) -> None:
+        if trade_date != self._date:
+            self._gap_pct     = gap_pct
+            self._prior_close = prior_close
+            self._fired       = False
+            self._date        = trade_date
+
+    async def on_tick(self, tick) -> Optional[Signal]: return None
+    async def on_candle(self, candle) -> Optional[Signal]: return None
+    async def on_greek_update(self, greeks) -> Optional[Signal]: return None
+
+    async def on_bar(
+        self,
+        candle,
+        walls: List,
+        term_analyses: List,
+        available_bp: float,
+        trade_date: str = "",
+        gap_pct: float = 0.0,
+        prior_close: float = 0.0,
+    ) -> Optional[Signal]:
+        if trade_date:
+            self.set_daily_context(gap_pct, prior_close, trade_date)
+        if self._fired or not term_analyses or abs(self._gap_pct) < self.SMALL_GAP:
+            return None
+
+        spot = candle.close
+        ts   = candle.timestamp
+        et_m = (ts.hour - 4) * 60 + ts.minute
+
+        # Enter between 10:00-10:30 AM (after opening noise settles)
+        if et_m < 10 * 60 or et_m > 10 * 60 + 30:
+            return None
+
+        gap = self._gap_pct
+        abs_gap = abs(gap)
+
+        # Small gap: expect fill (fade)
+        # Large gap: expect continuation
+        if abs_gap <= self.LARGE_GAP:
+            # Fade the gap
+            sig_type  = SignalType.BUY_PUT if gap > 0 else SignalType.BUY_CALL
+            target    = self._prior_close
+            conf_move = abs(spot - target) / max(target, 1.0)
+            score     = float(np.clip(0.55 + abs_gap * 10 + conf_move * 5, 0.0, 1.0))
+            reasoning = f"gap_fill: gap={gap*100:+.2f}% fading back to {target:.1f}"
+        else:
+            # Continuation
+            sig_type  = SignalType.BUY_CALL if gap > 0 else SignalType.BUY_PUT
+            score     = float(np.clip(0.60 + (abs_gap - self.LARGE_GAP) * 5, 0.0, 1.0))
+            reasoning = f"gap_continuation: gap={gap*100:+.2f}% continuing"
+
+        if score < self.SCORE_THRESHOLD:
+            return None
+
+        dte0   = next((a for a in term_analyses if a.dte == 0), term_analyses[0])
+        _dir   = 1 if sig_type == SignalType.BUY_CALL else -1
+        strike = round(_gamma_wall_strike(walls, spot, _dir, fallback=3.0))
+        premium = max(dte0.atm_iv * spot * (0.25 / 365.0) ** 0.5 * 0.4, 0.50)
+        kelly_f = np.clip((0.57 * 2.5 - 0.43) / 2.5, 0.0, 0.25)
+        n = max(1, int(kelly_f * self.account_bp * self.risk_pct / (premium * 100)))
+
+        self._fired = True
+        return Signal(
+            signal_type=sig_type, symbol=candle.symbol, timestamp=candle.timestamp,
+            strike=strike, expiry=dte0.expiry, confidence=score, position_size=n,
+            strategy_name=self.name,
+            metadata={"play_type": "gap_fill", "condition_score": score,
+                      "gap_pct": round(gap * 100, 3), "prior_close": self._prior_close,
+                      "reasoning": reasoning, "dte": dte0.dte,
+                      "call_strike": strike, "put_strike": strike},
+        )
+
+
+# ============================================================================
+# MOMENTUM CONTINUATION
+# After a strong directional move (first hour), ride the continuation.
+# High VIX days with strong early momentum often continue into close.
+# ============================================================================
+
+class MomentumStrategy(Strategy):
+    """
+    If SPY moves >0.6% in one direction in the first 60 minutes with
+    accelerating volume, the move tends to continue into close.
+    Buy options in the direction of the move. Enter on any pullback to VWAP.
+    """
+
+    MIN_MOVE_PCT  = 0.006   # 0.6% move in first hour
+    VOL_ACCEL     = 1.3     # volume must be accelerating (1.3× prior period)
+    SCORE_THRESHOLD = 0.70  # raised: momentum needs clear vol-confirmed move
+
+    def __init__(self, account_bp: float = 2500.0, risk_pct: float = 0.15):
+        super().__init__("Momentum")
+        self.account_bp   = account_bp
+        self.risk_pct     = risk_pct
+        self._open_price: float = 0.0
+        self._vol_first:  float = 0.0   # volume first 30 min
+        self._vol_second: float = 0.0   # volume next 30 min
+        self._phase:      int   = 0     # 0=building, 1=watching, 2=fired
+        self._direction:  int   = 0
+        self._date:       str   = ""
+
+    def set_daily_context(self, trade_date: str) -> None:
+        if trade_date != self._date:
+            self._open_price = 0.0
+            self._vol_first  = 0.0
+            self._vol_second = 0.0
+            self._phase      = 0
+            self._direction  = 0
+            self._date       = trade_date
+
+    async def on_tick(self, tick) -> Optional[Signal]: return None
+    async def on_candle(self, candle) -> Optional[Signal]: return None
+    async def on_greek_update(self, greeks) -> Optional[Signal]: return None
+
+    async def on_bar(
+        self,
+        candle,
+        walls: List,
+        term_analyses: List,
+        available_bp: float,
+        trade_date: str = "",
+    ) -> Optional[Signal]:
+        if trade_date:
+            self.set_daily_context(trade_date)
+        if self._phase == 2 or not term_analyses:
+            return None
+
+        spot = candle.close
+        vol  = float(candle.volume) if candle.volume else 0.0
+        ts   = candle.timestamp
+        et_m = (ts.hour - 4) * 60 + ts.minute
+
+        # Record open
+        if self._open_price == 0.0 and et_m >= 9 * 60 + 30:
+            self._open_price = candle.open
+
+        # Accumulate first-half volume (9:30-10:00)
+        if et_m < 10 * 60:
+            self._vol_first += vol
+            return None
+
+        # Accumulate second-half volume (10:00-10:30)
+        if et_m < 10 * 60 + 30:
+            self._vol_second += vol
+            return None
+
+        # After 10:30 — evaluate setup
+        if et_m > 13 * 60 or self._open_price == 0.0:
+            return None
+
+        move_pct  = (spot - self._open_price) / self._open_price
+        vol_accel = self._vol_second / max(self._vol_first, 1.0)
+
+        if abs(move_pct) < self.MIN_MOVE_PCT or vol_accel < self.VOL_ACCEL:
+            return None
+
+        direction = 1 if move_pct > 0 else -1
+        score = float(np.clip(
+            0.55 + abs(move_pct) * 20 + (vol_accel - 1.3) * 0.15, 0.0, 1.0
+        ))
+
+        if score < self.SCORE_THRESHOLD:
+            return None
+
+        dte0   = next((a for a in term_analyses if a.dte == 0), term_analyses[0])
+        strike = round(_gamma_wall_strike(walls, spot, direction, fallback=3.0))
+        sig_type = SignalType.BUY_CALL if direction > 0 else SignalType.BUY_PUT
+
+        premium = max(dte0.atm_iv * spot * (0.25 / 365.0) ** 0.5 * 0.4, 0.50)
+        kelly_f = np.clip((0.55 * 2.5 - 0.45) / 2.5, 0.0, 0.25)
+        n = max(1, int(kelly_f * self.account_bp * self.risk_pct / (premium * 100)))
+
+        self._phase = 2
+        return Signal(
+            signal_type=sig_type, symbol=candle.symbol, timestamp=candle.timestamp,
+            strike=strike, expiry=dte0.expiry, confidence=score, position_size=n,
+            strategy_name=self.name,
+            metadata={"play_type": "momentum", "condition_score": score,
+                      "move_pct": round(move_pct * 100, 3),
+                      "vol_accel": round(vol_accel, 2),
+                      "dte": dte0.dte, "call_strike": strike, "put_strike": strike},
+        )
+
+
+# ============================================================================
+# IV PERCENTILE MEAN REVERSION
+# When IV rank > 80: sell premium (straddle/strangle).
+# When IV rank < 20: buy straddle (vol is cheap, expect expansion).
+# ============================================================================
+
+class IVPercentileStrategy(Strategy):
+    """
+    Volatility mean reversion: IV always reverts to its historical average.
+    High IVR (>80) = sell straddle. Low IVR (<20) = buy straddle.
+    Uses the IVR seed data from Tastytrade IV history.
+    """
+
+    SELL_IVR  = 80
+    BUY_IVR   = 20
+    SCORE_THRESHOLD = 0.65
+
+    def __init__(self, account_bp: float = 2500.0, risk_pct: float = 0.12):
+        super().__init__("IVPercentile")
+        self.account_bp = account_bp
+        self.risk_pct   = risk_pct
+        self._ivr:  float = 50.0
+        self._fired: bool = False
+        self._date:  str  = ""
+
+    def set_daily_context(self, ivr: float, trade_date: str) -> None:
+        if trade_date != self._date:
+            self._ivr   = ivr
+            self._fired = False
+            self._date  = trade_date
+
+    async def on_tick(self, tick) -> Optional[Signal]: return None
+    async def on_candle(self, candle) -> Optional[Signal]: return None
+    async def on_greek_update(self, greeks) -> Optional[Signal]: return None
+
+    async def on_bar(
+        self,
+        candle,
+        walls: List,
+        term_analyses: List,
+        available_bp: float,
+        trade_date: str = "",
+        ivr: float = 50.0,
+    ) -> Optional[Signal]:
+        if trade_date:
+            self.set_daily_context(ivr, trade_date)
+        if self._fired or not term_analyses:
+            return None
+
+        ts   = candle.timestamp
+        et_m = (ts.hour - 4) * 60 + ts.minute
+        if et_m < 10 * 60 or et_m > 14 * 60:
+            return None
+
+        spot  = candle.close
+        ivr   = self._ivr
+        dte0  = next((a for a in term_analyses if a.dte == 0), term_analyses[0])
+
+        if ivr >= self.SELL_IVR:
+            sig_type = SignalType.SELL_STRADDLE
+            strike   = round(spot)
+            score    = float(np.clip(0.60 + (ivr - 80) / 100, 0.0, 1.0))
+        elif ivr <= self.BUY_IVR:
+            sig_type = SignalType.STRADDLE
+            strike   = round(spot)
+            score    = float(np.clip(0.60 + (20 - ivr) / 100, 0.0, 1.0))
+        else:
+            return None
+
+        if score < self.SCORE_THRESHOLD:
+            return None
+
+        premium = max(dte0.atm_iv * spot * (0.25 / 365.0) ** 0.5 * 0.4 * 2, 1.0)
+        kelly_f = 0.10
+        n = max(1, int(kelly_f * self.account_bp * self.risk_pct / (premium * 100)))
+
+        self._fired = True
+        return Signal(
+            signal_type=sig_type, symbol=candle.symbol, timestamp=candle.timestamp,
+            strike=strike, expiry=dte0.expiry, confidence=score, position_size=n,
+            strategy_name=self.name,
+            metadata={"play_type": "iv_percentile", "condition_score": score,
+                      "ivr": ivr, "dte": dte0.dte,
+                      "call_strike": strike, "put_strike": strike},
+        )

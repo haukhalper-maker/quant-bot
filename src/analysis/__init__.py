@@ -10,8 +10,10 @@ All financial math is implemented to production quality:
   - Gamma imbalance and support/resistance detection
 """
 
+import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -706,3 +708,440 @@ class AnalysisEngine:
             "resistance": resistance,
             "volume_divergence": vol_divergence,
         }
+
+
+# ============================================================================
+# GAMMA EXPOSURE ENGINE (GEX)
+# ============================================================================
+
+
+@dataclass
+class GammaWall:
+    """
+    A strike where gamma exposure is concentrated enough to influence price.
+
+    net_gex_dollars > 0 → dealers net long gamma → price-pinning / dampening
+    net_gex_dollars < 0 → dealers net short gamma → explosive moves amplified
+
+    confluence_score combines GEX size, options volume, OI, and proximity
+    to rank how much each level will actually affect price behavior.
+    """
+    strike: float
+    net_gex_dollars: float
+    call_gex: float
+    put_gex: float
+    total_oi: int
+    total_volume: int
+    call_volume: int
+    put_volume: int
+    confluence_score: float   # 0-1
+    distance_pct: float       # fractional distance from spot
+    wall_type: str            # 'pin' | 'explosive'
+
+    @property
+    def strength(self) -> str:
+        a = abs(self.net_gex_dollars)
+        if a >= 5_000_000:
+            return "major"
+        if a >= 1_000_000:
+            return "moderate"
+        return "minor"
+
+
+class GammaExposureEngine:
+    """
+    Compute net GEX per strike from a live Polygon options chain.
+
+    GEX (per strike, summed across all near-term expirations):
+        call_GEX = call_OI × call_gamma × 100 × spot
+        put_GEX  = put_OI  × put_gamma  × 100 × spot
+        net_GEX  = call_GEX − put_GEX
+
+    Positive net_GEX → dealers long gamma → stabilize / pin
+    Negative net_GEX → dealers short gamma → explosive moves
+
+    Confluence = GEX magnitude + options volume + OI + proximity to spot
+    combined into a single 0-1 score that ranks how significant each level is.
+    High volume at the same strike as high GEX = extremely reliable level.
+    """
+
+    def find_walls(
+        self,
+        contracts: List,          # List[PolygonOptionsContract]
+        spot: float,
+        max_distance_pct: float = 0.05,
+        max_dte_for_gex: int = 3,
+        top_n: int = 6,
+    ) -> List[GammaWall]:
+        """
+        Find the top-N gamma walls within max_distance_pct of spot.
+        Uses only DTE ≤ max_dte_for_gex — near-term options dominate gamma.
+        """
+        if not contracts or spot <= 0:
+            return []
+
+        by_strike: Dict[float, dict] = {}
+
+        for c in contracts:
+            if c.dte > max_dte_for_gex or c.dte < 0:
+                continue
+            if c.gamma <= 0 or c.open_interest <= 0:
+                continue
+            dist = abs(c.strike - spot) / spot
+            if dist > max_distance_pct:
+                continue
+
+            K = c.strike
+            if K not in by_strike:
+                by_strike[K] = {
+                    "call_gex": 0.0, "put_gex": 0.0,
+                    "call_oi": 0, "put_oi": 0,
+                    "call_vol": 0, "put_vol": 0,
+                }
+            gex = c.gamma * c.open_interest * 100 * spot
+            if c.contract_type == "call":
+                by_strike[K]["call_gex"]  += gex
+                by_strike[K]["call_oi"]   += c.open_interest
+                by_strike[K]["call_vol"]  += c.volume
+            else:
+                by_strike[K]["put_gex"]   += gex
+                by_strike[K]["put_oi"]    += c.open_interest
+                by_strike[K]["put_vol"]   += c.volume
+
+        walls: List[GammaWall] = []
+        for K, d in by_strike.items():
+            net       = d["call_gex"] - d["put_gex"]
+            total_oi  = d["call_oi"]  + d["put_oi"]
+            total_vol = d["call_vol"] + d["put_vol"]
+            dist      = abs(K - spot) / spot
+
+            # --- Confluence score ---
+            # GEX magnitude (big absolute GEX = dealers are very exposed here)
+            gex_s  = float(np.clip(abs(net) / 2_000_000, 0.0, 1.0))
+            # Options volume today at this strike
+            vol_s  = float(np.clip(total_vol / 5_000, 0.0, 1.0))
+            # Open interest (existing positioning)
+            oi_s   = float(np.clip(total_oi / 50_000, 0.0, 1.0))
+            # Distance decay — levels closer to spot matter more
+            dist_s = float(np.clip(1.0 - dist * 25, 0.0, 1.0))
+            # Fresh-money ratio: high volume/OI = active positioning happening now
+            voi    = float(np.clip(total_vol / max(total_oi, 1), 0.0, 0.5)) * 2.0
+
+            confluence = (
+                gex_s  * 0.35 +
+                vol_s  * 0.25 +
+                oi_s   * 0.20 +
+                dist_s * 0.15 +
+                voi    * 0.05
+            )
+
+            walls.append(GammaWall(
+                strike=K,
+                net_gex_dollars=net,
+                call_gex=d["call_gex"],
+                put_gex=d["put_gex"],
+                total_oi=total_oi,
+                total_volume=total_vol,
+                call_volume=d["call_vol"],
+                put_volume=d["put_vol"],
+                confluence_score=float(np.clip(confluence, 0.0, 1.0)),
+                distance_pct=dist,
+                wall_type="pin" if net >= 0 else "explosive",
+            ))
+
+        walls.sort(
+            key=lambda w: abs(w.net_gex_dollars) * w.confluence_score,
+            reverse=True,
+        )
+        return walls[:top_n]
+
+    def net_gex_surface(
+        self, contracts: List, spot: float
+    ) -> Dict[float, float]:
+        """Full GEX surface across all strikes (for logging/charting)."""
+        surface: Dict[float, float] = {}
+        for c in contracts:
+            if c.gamma <= 0 or c.open_interest <= 0:
+                continue
+            gex = c.gamma * c.open_interest * 100 * spot
+            if c.contract_type == "call":
+                surface[c.strike] = surface.get(c.strike, 0.0) + gex
+            else:
+                surface[c.strike] = surface.get(c.strike, 0.0) - gex
+        return surface
+
+
+# ============================================================================
+# IV TERM STRUCTURE
+# ============================================================================
+
+
+@dataclass
+class DTEAnalysis:
+    """IV and move statistics for a specific DTE / expiration."""
+    dte: int
+    expiry: str
+    atm_iv: float
+    expected_move_1sd: float    # 1-sigma move in $ (68% probability range ±)
+    iv_premium_vs_next: float   # ratio vs next-farther DTE (> 1.0 = this DTE elevated)
+    crush_probability: float    # 0-1  likelihood IV decays significantly by expiry
+    kelly_sell_fraction: float  # Kelly-optimal fraction for selling this DTE premium
+
+
+class IVTermStructureAnalyzer:
+    """
+    Build and analyze the IV term structure from 0DTE to 30DTE.
+
+    Key outputs:
+    - Per-DTE analysis (atm_iv, expected_move, crush_prob, kelly fraction)
+    - Best DTE for a given play type
+    - Crush probability driven by steepness of the 0DTE / 1DTE spread
+    """
+
+    def analyze(
+        self,
+        contracts: List,
+        spot: float,
+        max_dte: int = 7,
+    ) -> List[DTEAnalysis]:
+        """Build term structure from available expirations."""
+        if not contracts or spot <= 0:
+            return []
+
+        by_dte: Dict[int, List] = {}
+        for c in contracts:
+            if 0 <= c.dte <= max_dte and c.implied_vol > 0.01:
+                by_dte.setdefault(c.dte, []).append(c)
+
+        sorted_dtes = sorted(by_dte.keys())
+        analyses: List[DTEAnalysis] = []
+
+        for i, dte in enumerate(sorted_dtes):
+            cs = by_dte[dte]
+            atm = sorted(cs, key=lambda c: abs(c.strike - spot))[:8]
+            if not atm:
+                continue
+
+            atm_iv = float(np.mean([c.implied_vol for c in atm]))
+            T = max(dte, 0.25) / 365.0
+            expected_move = atm_iv * spot * float(np.sqrt(T))
+
+            iv_premium = 1.0
+            if i + 1 < len(sorted_dtes):
+                next_cs = by_dte[sorted_dtes[i + 1]]
+                next_atm = sorted(next_cs, key=lambda c: abs(c.strike - spot))[:8]
+                if next_atm:
+                    next_iv = float(np.mean([c.implied_vol for c in next_atm]))
+                    iv_premium = atm_iv / max(next_iv, 0.01)
+
+            crush_prob = float(np.clip((iv_premium - 1.0) * 3.0, 0.0, 1.0))
+
+            # Kelly fraction for short-premium position on this DTE
+            p_win = max(0.35, crush_prob * 0.45 + 0.35)
+            b = 0.5   # take profit at 50% of premium collected
+            kelly = float(np.clip(max(0.0, (p_win * b - (1 - p_win)) / b), 0.0, 0.25))
+
+            analyses.append(DTEAnalysis(
+                dte=dte,
+                expiry=atm[0].expiry,
+                atm_iv=atm_iv,
+                expected_move_1sd=expected_move,
+                iv_premium_vs_next=iv_premium,
+                crush_probability=crush_prob,
+                kelly_sell_fraction=kelly,
+            ))
+
+        return analyses
+
+    def select_best_dte(
+        self,
+        analyses: List[DTEAnalysis],
+        play_type: str,
+        max_dte: int = 3,
+    ) -> Optional[DTEAnalysis]:
+        """Return the DTE with the best edge for the given play type."""
+        if not analyses:
+            return None
+        eligible = [a for a in analyses if a.dte <= max_dte] or analyses
+        if play_type == "iv_crush":
+            return max(eligible, key=lambda a: a.crush_probability * a.kelly_sell_fraction)
+        elif play_type == "explosive":
+            return min(eligible, key=lambda a: a.dte)
+        else:  # pin
+            return max(eligible, key=lambda a: a.crush_probability * max(1 - a.dte / 8, 0.1))
+
+
+# ============================================================================
+# PREDICTION LOGGER — SQLite self-learning accuracy tracker
+# ============================================================================
+
+
+@dataclass
+class SetupPrediction:
+    """Every identified setup is logged here, whether we trade it or not."""
+    timestamp: datetime
+    symbol: str
+    wall_strike: float
+    spot_price: float
+    dte: int
+    net_gex_dollars: float
+    confluence_score: float
+    play_type: str           # 'pin' | 'explosive' | 'iv_crush'
+    predicted_outcome: str   # 'pin' | 'break_up' | 'break_down' | 'crush'
+    predicted_low: float     # lower bound of predicted price range at expiry
+    predicted_high: float    # upper bound
+    condition_score: float   # weighted setup score 0-1
+    traded: bool = False
+    pnl: Optional[float] = None
+
+
+class PredictionLogger:
+    """
+    Persists every identified setup to SQLite.
+
+    Self-learning loop:
+        1. Every bar: log a prediction (wall, play type, predicted range)
+        2. At option expiry: resolve with actual price → outcome_correct flag
+        3. get_calibrated_win_rate() returns per-play-type accuracy
+        4. ZeroDTEStrategy uses these win rates for Kelly position sizing
+
+    After ~30 sessions the accuracy calibration makes sizing significantly smarter.
+    All data is real — no synthetic prices. The longer it runs, the better it gets.
+    """
+
+    _DEFAULT_DB = "data/predictions.db"
+
+    def __init__(self, db_path: str = None):
+        path = db_path or self._DEFAULT_DB
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        self._db_path = path
+        self._conn: Optional[sqlite3.Connection] = None
+        self._init_db()
+
+    def _get_conn(self) -> sqlite3.Connection:
+        if self._conn is None:
+            self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
+            self._conn.row_factory = sqlite3.Row
+        return self._conn
+
+    def _init_db(self) -> None:
+        c = self._get_conn()
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS predictions (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp        TEXT    NOT NULL,
+                symbol           TEXT,
+                wall_strike      REAL,
+                spot_price       REAL,
+                dte              INTEGER,
+                net_gex_dollars  REAL,
+                confluence_score REAL,
+                play_type        TEXT,
+                predicted_outcome TEXT,
+                predicted_low    REAL,
+                predicted_high   REAL,
+                condition_score  REAL,
+                traded           INTEGER DEFAULT 0,
+                pnl              REAL,
+                actual_price     REAL,
+                outcome_correct  INTEGER,
+                llm_reasoning    TEXT,
+                llm_confidence   REAL
+            )
+        """)
+        c.execute("CREATE INDEX IF NOT EXISTS idx_ts   ON predictions(timestamp)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_play ON predictions(play_type, outcome_correct)")
+        c.commit()
+
+    def log(
+        self,
+        pred: SetupPrediction,
+        llm_reasoning: str = "",
+        llm_confidence: float = 0.0,
+    ) -> int:
+        """Insert prediction. Returns row ID for later resolution."""
+        c = self._get_conn()
+        cur = c.execute(
+            """
+            INSERT INTO predictions
+              (timestamp, symbol, wall_strike, spot_price, dte,
+               net_gex_dollars, confluence_score, play_type,
+               predicted_outcome, predicted_low, predicted_high,
+               condition_score, traded, pnl, llm_reasoning, llm_confidence)
+            VALUES (?,?,?,?,?, ?,?,?,?,?,?, ?,?,?,?,?)
+            """,
+            (
+                pred.timestamp.isoformat(), pred.symbol,
+                pred.wall_strike, pred.spot_price, pred.dte,
+                pred.net_gex_dollars, pred.confluence_score, pred.play_type,
+                pred.predicted_outcome, pred.predicted_low, pred.predicted_high,
+                pred.condition_score, int(pred.traded), pred.pnl,
+                llm_reasoning, llm_confidence,
+            ),
+        )
+        c.commit()
+        return cur.lastrowid
+
+    def resolve(
+        self,
+        prediction_id: int,
+        actual_price: float,
+        pnl: Optional[float] = None,
+    ) -> None:
+        """Mark a prediction resolved with the actual expiry price."""
+        c = self._get_conn()
+        row = c.execute(
+            "SELECT predicted_low, predicted_high FROM predictions WHERE id=?",
+            (prediction_id,),
+        ).fetchone()
+        if not row:
+            return
+        low, high = row["predicted_low"], row["predicted_high"]
+        correct = int(low <= actual_price <= high) if (low is not None and high is not None) else 0
+        c.execute(
+            "UPDATE predictions SET actual_price=?, outcome_correct=?, pnl=? WHERE id=?",
+            (actual_price, correct, pnl, prediction_id),
+        )
+        c.commit()
+
+    def get_accuracy_stats(self, lookback_days: int = 30) -> Dict[str, dict]:
+        """Per-play-type accuracy stats for calibration."""
+        c = self._get_conn()
+        rows = c.execute(
+            """
+            SELECT play_type,
+                   COUNT(*)                                        AS total,
+                   AVG(outcome_correct)                            AS accuracy,
+                   AVG(CASE WHEN traded=1 THEN pnl ELSE NULL END) AS avg_pnl,
+                   COUNT(CASE WHEN traded=1 THEN 1 END)           AS traded_count
+            FROM predictions
+            WHERE outcome_correct IS NOT NULL
+              AND timestamp > datetime('now', ?)
+            GROUP BY play_type
+            """,
+            (f"-{lookback_days} days",),
+        ).fetchall()
+        return {
+            r["play_type"]: {
+                "total":        r["total"],
+                "accuracy":     float(r["accuracy"] or 0),
+                "avg_pnl":      float(r["avg_pnl"] or 0),
+                "traded_count": r["traded_count"] or 0,
+            }
+            for r in rows
+        }
+
+    def get_calibrated_win_rate(
+        self, play_type: str, min_samples: int = 15
+    ) -> float:
+        """Win rate for Kelly sizing — falls back to 0.50 until min_samples exist."""
+        stats = self.get_accuracy_stats()
+        data = stats.get(play_type, {})
+        if data.get("traded_count", 0) >= min_samples:
+            return float(np.clip(data["accuracy"], 0.30, 0.80))
+        return 0.50
+
+    def close(self) -> None:
+        if self._conn:
+            self._conn.close()
+            self._conn = None

@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from abc import ABC, abstractmethod
 
+import asyncio
+import json
 import httpx
 import numpy as np
 from dotenv import load_dotenv
@@ -210,29 +212,311 @@ class InteractiveBrokersConnector(DataConnector):
         raise NotImplementedError()
 
 
+@dataclass
+class PolygonOptionsContract:
+    """Single options contract from Polygon v3 snapshot API."""
+    ticker: str           # e.g. O:SPY240419C00530000
+    symbol: str           # underlying, e.g. SPY
+    strike: float
+    expiry: str           # YYYY-MM-DD
+    contract_type: str    # 'call' | 'put'
+    bid: float = 0.0
+    ask: float = 0.0
+    mid: float = 0.0
+    open_interest: int = 0
+    volume: int = 0
+    implied_vol: float = 0.0
+    delta: float = 0.0
+    gamma: float = 0.0
+    theta: float = 0.0
+    vega: float = 0.0
+    vwap: float = 0.0
+    dte: int = 0
+    underlying_price: float = 0.0
+
+
 class PolygonConnector(DataConnector):
     """
-    [API: Polygon.io Real-time & Historical Data]
-    To implement: Use polygon-api-client library
-    Docs: https://polygon.io/docs/options/getting-started
+    Polygon.io (Massive) — full REST + WebSocket implementation.
+
+    Options snapshot  GET /v3/snapshot/options/{underlyingAsset}
+      Returns per-contract greeks, OI, volume, IV, bid/ask.
+      Auto-paginates (250 per page). Cached 60 seconds.
+
+    Historical bars   GET /v2/aggs/ticker/{sym}/range/{mult}/{ts}/{from}/{to}
+      1-minute OHLCV for intraday replay and backtest.
+
+    WebSocket         wss://socket.polygon.io/stocks
+      Real-time per-second aggregates for live price feed.
     """
 
+    _BASE = "https://api.polygon.io"
+    _WS_URL = "wss://socket.polygon.io/stocks"
+    _CHAIN_TTL = 60.0   # seconds
+
+    def __init__(self, api_key: str = None):
+        super().__init__("PolygonConnector")
+        load_dotenv(Path(__file__).resolve().parents[2] / ".env")
+        self.api_key = api_key or os.getenv("POLYGON_API_KEY", "")
+        self._client: Optional[httpx.AsyncClient] = None
+        self._chain_cache: Dict[str, dict] = {}
+        self._tick_callbacks: Dict[str, List] = {}
+        self._ws_task: Optional[asyncio.Task] = None
+
     async def connect(self) -> bool:
-        raise NotImplementedError("[API: Polygon.io] not yet implemented")
+        if not self.api_key:
+            raise ValueError("POLYGON_API_KEY must be set in .env")
+        self._client = httpx.AsyncClient(timeout=30.0)
+        for attempt in range(4):
+            resp = await self._client.get(
+                f"{self._BASE}/v2/aggs/ticker/SPY/prev",
+                params={"apiKey": self.api_key},
+            )
+            if resp.status_code == 200:
+                break
+            if resp.status_code == 429 and attempt < 3:
+                wait = 15 * (attempt + 1)
+                logger.warning(f"[Polygon] Rate limited on connect — retrying in {wait}s")
+                await asyncio.sleep(wait)
+                continue
+            await self._client.aclose()
+            raise RuntimeError(
+                f"Polygon key validation failed: HTTP {resp.status_code}"
+            )
+        self.is_connected = True
+        logger.info(f"[Polygon] Connected  key=...{self.api_key[-6:]}")
+        return True
 
     async def disconnect(self) -> None:
-        pass
+        if self._ws_task and not self._ws_task.done():
+            self._ws_task.cancel()
+        if self._client:
+            await self._client.aclose()
+        self.is_connected = False
+        logger.info("[Polygon] Disconnected")
+
+    # ------------------------------------------------------------------ #
+    # Options chain snapshot                                               #
+    # ------------------------------------------------------------------ #
+
+    async def get_options_snapshot(
+        self,
+        symbol: str,
+        max_dte: int = 7,
+    ) -> List[PolygonOptionsContract]:
+        """
+        Full options chain from Polygon v3 snapshot.
+        Fetches all pages, filters to DTE 0–max_dte.
+        Greeks are provided by Polygon — no BSM needed here.
+        """
+        now = time.monotonic()
+        cached = self._chain_cache.get(symbol, {})
+        if cached and now - cached.get("fetched_at", 0) < self._CHAIN_TTL:
+            return cached["contracts"]
+
+        today = datetime.utcnow().date()
+        contracts: List[PolygonOptionsContract] = []
+        url = f"{self._BASE}/v3/snapshot/options/{symbol}"
+        params: dict = {"apiKey": self.api_key, "limit": 250}
+
+        while url:
+            try:
+                resp = await self._client.get(url, params=params)
+                if resp.status_code != 200:
+                    logger.warning(
+                        f"[Polygon] snapshot HTTP {resp.status_code}: {resp.text[:200]}"
+                    )
+                    break
+                body = resp.json()
+            except Exception as exc:
+                logger.warning(f"[Polygon] snapshot error: {exc}")
+                break
+
+            for r in body.get("results", []):
+                details = r.get("details") or {}
+                greeks  = r.get("greeks")  or {}
+                day     = r.get("day")     or {}
+                lq      = r.get("last_quote") or {}
+
+                expiry_str = details.get("expiration_date", "")
+                if not expiry_str:
+                    continue
+                try:
+                    exp_dt = datetime.strptime(expiry_str, "%Y-%m-%d").date()
+                    dte = (exp_dt - today).days
+                except ValueError:
+                    continue
+                if dte < 0 or dte > max_dte:
+                    continue
+
+                bid = float(lq.get("bid") or r.get("bid") or 0)
+                ask = float(lq.get("ask") or r.get("ask") or 0)
+                mid_p = (bid + ask) / 2 if (bid + ask) > 0 else 0.0
+
+                contracts.append(PolygonOptionsContract(
+                    ticker=r.get("ticker", ""),
+                    symbol=symbol,
+                    strike=float(details.get("strike_price") or 0),
+                    expiry=expiry_str,
+                    contract_type=(details.get("contract_type") or "call").lower(),
+                    bid=bid,
+                    ask=ask,
+                    mid=mid_p,
+                    open_interest=int(r.get("open_interest") or 0),
+                    volume=int(day.get("volume") or 0),
+                    implied_vol=float(r.get("implied_volatility") or 0),
+                    delta=float(greeks.get("delta") or 0),
+                    gamma=float(greeks.get("gamma") or 0),
+                    theta=float(greeks.get("theta") or 0),
+                    vega=float(greeks.get("vega") or 0),
+                    vwap=float(day.get("vwap") or 0),
+                    dte=dte,
+                    underlying_price=float(
+                        (r.get("underlying_asset") or {}).get("price") or 0
+                    ),
+                ))
+
+            next_url = body.get("next_url")
+            if next_url:
+                url = next_url
+                params = {"apiKey": self.api_key}
+            else:
+                break
+
+        self._chain_cache[symbol] = {"contracts": contracts, "fetched_at": now}
+        logger.debug(
+            f"[Polygon] {symbol}: {len(contracts)} contracts (DTE 0-{max_dte})"
+        )
+        return contracts
+
+    async def get_bars(
+        self,
+        symbol: str,
+        date: str,
+        multiplier: int = 1,
+        timespan: str = "minute",
+    ) -> List[Candle]:
+        """Historical intraday bars. date = 'YYYY-MM-DD'."""
+        url = (
+            f"{self._BASE}/v2/aggs/ticker/{symbol}/range/"
+            f"{multiplier}/{timespan}/{date}/{date}"
+        )
+        try:
+            resp = await self._client.get(
+                url,
+                params={
+                    "apiKey": self.api_key,
+                    "adjusted": "true",
+                    "sort": "asc",
+                    "limit": 50000,
+                },
+            )
+            if resp.status_code != 200:
+                logger.warning(f"[Polygon] bars HTTP {resp.status_code}")
+                return []
+        except Exception as exc:
+            logger.warning(f"[Polygon] bars error: {exc}")
+            return []
+
+        try:
+            results = resp.json().get("results", [])
+        except Exception as exc:
+            logger.warning(f"[Polygon] bars JSON parse error (likely truncated 429 body): {exc}")
+            return []
+
+        candles = []
+        for r in results:
+            ts = datetime.utcfromtimestamp(r["t"] / 1000)
+            candles.append(Candle(
+                symbol=symbol,
+                timestamp=ts,
+                open=float(r["o"]),
+                high=float(r["h"]),
+                low=float(r["l"]),
+                close=float(r["c"]),
+                volume=int(r.get("v", 0)),
+                timeframe=f"{multiplier}{timespan[0]}",
+            ))
+        return candles
+
+    # ------------------------------------------------------------------ #
+    # WebSocket — real-time per-second aggregates                          #
+    # ------------------------------------------------------------------ #
 
     async def subscribe_ticks(self, symbol: str, callback) -> None:
-        raise NotImplementedError()
+        self._tick_callbacks.setdefault(symbol, []).append(callback)
+        if self._ws_task is None or self._ws_task.done():
+            self._ws_task = asyncio.create_task(self._ws_run())
+
+    async def _ws_run(self) -> None:
+        import websockets as _ws
+        backoff = 1.0
+        while True:
+            try:
+                async with _ws.connect(self._WS_URL) as ws:
+                    backoff = 1.0
+                    await ws.send(json.dumps(
+                        {"action": "auth", "params": self.api_key}
+                    ))
+                    for sym in self._tick_callbacks:
+                        await ws.send(json.dumps(
+                            {"action": "subscribe", "params": f"A.{sym}"}
+                        ))
+                    async for raw in ws:
+                        for ev in json.loads(raw):
+                            if ev.get("ev") != "A":
+                                continue
+                            sym = ev.get("sym", "")
+                            if sym not in self._tick_callbacks:
+                                continue
+                            tick = Tick(
+                                symbol=sym,
+                                timestamp=datetime.utcfromtimestamp(
+                                    ev.get("e", 0) / 1000
+                                ),
+                                price=float(ev.get("c") or ev.get("vw") or 0),
+                                size=int(ev.get("av", 0)),
+                            )
+                            for cb in self._tick_callbacks[sym]:
+                                asyncio.create_task(cb(tick))
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.warning(
+                    f"[Polygon] WS error: {exc}. Reconnecting in {backoff:.0f}s"
+                )
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 60.0)
+
+    # ------------------------------------------------------------------ #
+    # DataConnector interface                                               #
+    # ------------------------------------------------------------------ #
 
     async def get_historical_ticks(
         self, symbol: str, start_time: datetime, end_time: datetime
     ) -> List[Tick]:
-        raise NotImplementedError()
+        return []
 
-    async def get_options_chain(self, symbol: str, expiry: str) -> List[OptionsChain]:
-        raise NotImplementedError()
+    async def get_options_chain(
+        self, symbol: str, expiry: str = None
+    ) -> List[OptionsChain]:
+        contracts = await self.get_options_snapshot(symbol)
+        result = []
+        for c in contracts:
+            if expiry and c.expiry != expiry:
+                continue
+            result.append(OptionsChain(
+                symbol=c.symbol,
+                expiry=c.expiry,
+                strike=c.strike,
+                option_type=c.contract_type.upper(),
+                bid=c.bid,
+                ask=c.ask,
+                open_interest=c.open_interest,
+                volume=c.volume,
+                impliedVol=c.implied_vol,
+            ))
+        return result
 
 
 class AlpacaConnector(DataConnector):
@@ -289,22 +573,32 @@ class TastytradeConnector(DataConnector):
     The get_dealer_gamma_skew() docstring explains the approximation.
     """
 
-    _BASE_URL = "https://api.tastytrade.com"
-    _METRICS_TTL = 60.0     # seconds — market metrics cache TTL
-    _CHAIN_TTL = 300.0      # seconds — option chain cache TTL
+    _BASE_URL      = "https://api.tastytrade.com"
+    _BASE_URL_CERT = "https://api.cert.tastyworks.com"   # paper/sandbox
+    _METRICS_TTL = 60.0
+    _CHAIN_TTL   = 300.0
 
-    def __init__(self, username: str = None, password: str = None):
+    def __init__(self, username: str = None, password: str = None,
+                 api_token: str = None, cert: bool = False):
         super().__init__("TastytradeConnector")
         load_dotenv(Path(__file__).resolve().parents[2] / ".env")
-        self.username = username or os.getenv("TASTYTRADE_USERNAME", "")
-        self.password = password or os.getenv("TASTYTRADE_PASSWORD", "")
+        self.username      = username  or os.getenv("TASTYTRADE_USERNAME", "")
+        self.password      = password  or os.getenv("TASTYTRADE_PASSWORD", "")
+        # OAuth credentials from developer.tastytrade.com
+        self.client_id     = os.getenv("TASTYTRADE_CLIENT_ID", "")
+        self.client_secret = os.getenv("TASTYTRADE_CLIENT_SECRET", "")
+        self.grant_token   = os.getenv("TASTYTRADE_GRANT_TOKEN", "")
+        # Legacy: pre-issued raw session token (still supported)
+        self.api_token     = api_token or os.getenv("TASTYTRADE_API_TOKEN", "")
+        self._base         = self._BASE_URL_CERT if cert else self._BASE_URL
+        self._oauth_url    = f"{self._BASE_URL}/oauth/token"  # identity server is always live
+        self.cert          = cert
         self._session_token: Optional[str] = None
-        self._challenge_token: Optional[str] = None   # device challenge token (transient)
+        self._refresh_token: Optional[str] = None
+        self._challenge_token: Optional[str] = None
         self._client: Optional[httpx.AsyncClient] = None
         self._accounts: List[dict] = []
-        # symbol → {iv, iv_rank, iv_pct, hv30, iv30, fetched_at}
         self._metrics_cache: Dict[str, dict] = {}
-        # symbol → {expirations: [...], fetched_at}
         self._chain_cache: Dict[str, dict] = {}
 
     # ------------------------------------------------------------------ #
@@ -341,19 +635,37 @@ class TastytradeConnector(DataConnector):
         otp : str, optional
             The SMS / email OTP code from step 2.  Pass this on retry.
         """
-        if not self.username or not self.password:
-            raise ValueError(
-                "TASTYTRADE_USERNAME and TASTYTRADE_PASSWORD must be set in .env"
-            )
-
         if self._client is None:
             self._client = httpx.AsyncClient(
-                base_url=self._BASE_URL,
+                base_url=self._base,
                 headers={
                     "Accept": "application/json",
                     "Content-Type": "application/json",
                 },
                 timeout=30.0,
+            )
+
+        # ── Auth priority ──────────────────────────────────────────────────
+        # 1. OAuth (grant_token + client_id + client_secret) — preferred
+        # 2. Raw session token (TASTYTRADE_API_TOKEN) — legacy
+        # 3. Username + password — fallback
+
+        if self.grant_token and self.client_id and self.client_secret:
+            result = await self._oauth_connect()
+            if result:
+                return result
+            # OAuth failed — fall through to username/password
+
+        if self.api_token:
+            self._session_token = self.api_token
+            self._client.headers.update({"Authorization": self.api_token})
+            logger.info("Tastytrade: using raw API token")
+            return await self._finish_connect("(api-token)")
+
+        if not self.username or not self.password:
+            raise ValueError(
+                "Set TASTYTRADE_GRANT_TOKEN + TASTYTRADE_CLIENT_ID + TASTYTRADE_CLIENT_SECRET "
+                "(or TASTYTRADE_USERNAME + TASTYTRADE_PASSWORD) in .env"
             )
 
         login_body = {
@@ -407,22 +719,96 @@ class TastytradeConnector(DataConnector):
             )
 
         # ── Auth successful ─────────────────────────────────────────
-        self._challenge_token = None   # clear — no longer needed
+        self._challenge_token = None
         payload = resp.json()["data"]
         self._session_token = payload["session-token"]
         self._client.headers.update({"Authorization": self._session_token})
+        return await self._finish_connect(payload.get("user", {}).get("username", self.username))
 
-        # Fetch and cache accounts
+    async def _oauth_connect(self) -> bool:
+        """
+        Exchange grant token for an access token using OAuth 2.0
+        client_credentials + grant_token flow.
+
+        Tastytrade OAuth endpoint: https://id.tastytrade.com/oauth/token
+        Body (application/x-www-form-urlencoded):
+            grant_type=authorization_code
+            code=<TASTYTRADE_GRANT_TOKEN>
+            client_id=<TASTYTRADE_CLIENT_ID>
+            client_secret=<TASTYTRADE_CLIENT_SECRET>
+            redirect_uri=https://localhost  (required by Tastytrade OAuth)
+
+        The access_token returned is used as the Authorization header.
+        The refresh_token is stored so we can silently renew when it expires
+        (access tokens are typically valid for 24h).
+        """
+        import httpx as _httpx
+        async with _httpx.AsyncClient(timeout=15.0) as oauth_client:
+            resp = await oauth_client.post(
+                self._oauth_url,
+                data={
+                    "grant_type":    "authorization_code",
+                    "code":          self.grant_token,
+                    "client_id":     self.client_id,
+                    "client_secret": self.client_secret,
+                    "redirect_uri":  "http://localhost:8000/",
+                },
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+
+        if resp.status_code != 200:
+            logger.warning(
+                f"Tastytrade OAuth failed ({resp.status_code}), falling back to username/password"
+            )
+            return False  # caller will try next auth method
+
+        data = resp.json()
+        access_token          = data["access_token"]
+        self._refresh_token   = data.get("refresh_token", "")
+        self._session_token   = access_token
+        self._client.headers.update({"Authorization": f"Bearer {access_token}"})
+        logger.info(
+            f"Tastytrade OAuth OK  env={'cert' if self.cert else 'live'}  "
+            f"expires_in={data.get('expires_in', '?')}s"
+        )
+        return await self._finish_connect("(oauth)")
+
+    async def _refresh_access_token(self) -> bool:
+        """Use the refresh token to get a new access token without re-auth."""
+        if not self._refresh_token:
+            return False
+        import httpx as _httpx
+        async with _httpx.AsyncClient(timeout=15.0) as c:
+            resp = await c.post(
+                self._oauth_url,
+                data={
+                    "grant_type":    "refresh_token",
+                    "refresh_token": self._refresh_token,
+                    "client_id":     self.client_id,
+                    "client_secret": self.client_secret,
+                },
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+        if resp.status_code != 200:
+            logger.warning(f"Tastytrade token refresh failed: {resp.status_code}")
+            return False
+        data = resp.json()
+        self._session_token = data["access_token"]
+        self._refresh_token = data.get("refresh_token", self._refresh_token)
+        self._client.headers.update({"Authorization": f"Bearer {self._session_token}"})
+        logger.info("Tastytrade access token refreshed")
+        return True
+
+    async def _finish_connect(self, username_display: str = "") -> bool:
+        """Shared post-auth step: fetch accounts and mark connected."""
         acc_resp = await self._client.get("/customers/me/accounts")
         if acc_resp.status_code == 200:
             items = acc_resp.json()["data"]["items"]
             self._accounts = [item["account"] for item in items]
-
         self.is_connected = True
-        username_display = payload.get("user", {}).get("username", self.username)
         logger.info(
-            f"Tastytrade connected — user={username_display!r} "
-            f"accounts={len(self._accounts)}"
+            f"Tastytrade connected — user={username_display!r}  "
+            f"env={'cert' if self.cert else 'live'}  accounts={len(self._accounts)}"
         )
         return True
 

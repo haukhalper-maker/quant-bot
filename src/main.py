@@ -11,9 +11,11 @@ Usage:
 
 import asyncio
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
+
+from dotenv import load_dotenv
 
 import click
 import numpy as np
@@ -28,14 +30,26 @@ from src.strategy import (
     GammaScalpingStrategy,
     GammaImbalanceTrader,
     TailHedgeStrategy,
+    ZeroDTEStrategy,
+    ORBStrategy,
+    VWAPStrategy,
+    GapFillStrategy,
+    MomentumStrategy,
+    IVPercentileStrategy,
     RuleEngine,
     Signal,
     SignalType,
 )
-from src.execution import PaperTradingExecutor, signal_to_orders, OrderSide
+from src.execution import PaperTradingExecutor, TastytradeExecutor, signal_to_orders, OrderSide
 from src.risk import RiskMonitor, RiskLimits, CircuitBreaker
 from src.portfolio import PortfolioManager
-from src.llm import LocalLLMClient, TradeReasoningEngine
+from src.llm import LocalLLMClient, TradeReasoningEngine, ZeroDTEReasoningEngine
+from src.market_data import PolygonConnector
+from src.analysis import (
+    GammaExposureEngine,
+    IVTermStructureAnalyzer,
+    PredictionLogger,
+)
 
 
 # ============================================================================
@@ -495,11 +509,13 @@ class BacktestRunner:
     realistic execution, and portfolio P&L tracking.
     """
 
-    def __init__(self, config: BotConfig, data_connector=None, enable_hedge: bool = True):
+    def __init__(self, config: BotConfig, data_connector=None, enable_hedge: bool = True,
+                 initial_capital: float = 100_000.0):
         self.config = config
         self.data_connector = data_connector or MockDataConnector()
         self.analysis = AnalysisEngine()
         self.enable_hedge = enable_hedge
+        self._initial_capital = initial_capital
 
         # LLM (optional in backtest — useful for validating LLM logic offline)
         self.reasoning_engine: Optional[TradeReasoningEngine] = None
@@ -521,7 +537,7 @@ class BacktestRunner:
             commission_per_contract=0.65,
             half_spread_bps=5.0,
         )
-        self.portfolio = PortfolioManager(initial_cash=100_000.0)
+        self.portfolio = PortfolioManager(initial_cash=self._initial_capital)
         self.risk_monitor = RiskMonitor(
             RiskLimits(
                 max_portfolio_delta=config.max_portfolio_delta,
@@ -533,7 +549,7 @@ class BacktestRunner:
 
         self.start_date: Optional[datetime] = None
         self.end_date: Optional[datetime] = None
-        self._prev_portfolio_value: float = 100_000.0
+        self._prev_portfolio_value: float = self._initial_capital
 
     @staticmethod
     def _detect_regime(start: datetime, end: datetime) -> str:
@@ -785,7 +801,7 @@ class BacktestRunner:
                         strategy.update_portfolio_state(
                             current_value=current_portfolio_value,
                             peak_value=peak_value,
-                            capital=100_000.0,
+                            capital=current_portfolio_value,
                         )
 
                 # Collect strategy signals; sync IV estimates into analysis engine
@@ -1192,9 +1208,10 @@ def backtest(start: str, end: str, symbols: str, capital: float, no_llm: bool,
 @click.option("--start",   default="2019-01-01", help="Start date (YYYY-MM-DD)")
 @click.option("--end",     default="2024-12-31", help="End date (YYYY-MM-DD)")
 @click.option("--symbols", default="SPY",         help="Comma-separated symbols")
+@click.option("--capital", default=100_000.0, type=float, help="Starting capital")
 @click.option("--no-llm",  is_flag=True, default=False, help="Disable LLM validation")
 @click.option("--no-hedge", is_flag=True, default=False, help="Disable tail hedge")
-def report(start: str, end: str, symbols: str, no_llm: bool, no_hedge: bool):
+def report(start: str, end: str, symbols: str, capital: float, no_llm: bool, no_hedge: bool):
     """
     Full performance report over a multi-year backtest.
 
@@ -1210,7 +1227,8 @@ def report(start: str, end: str, symbols: str, no_llm: bool, no_hedge: bool):
         symbols=symbols.split(","),
         llm_enabled=not no_llm,
     )
-    runner = BacktestRunner(config, MockDataConnector(), enable_hedge=not no_hedge)
+    runner = BacktestRunner(config, MockDataConnector(), enable_hedge=not no_hedge,
+                            initial_capital=capital)
     results = asyncio.run(runner.run(start, end))
 
     hedge_label = "hedged" if not no_hedge else "unhedged"
@@ -1288,10 +1306,12 @@ def report(start: str, end: str, symbols: str, no_llm: bool, no_hedge: bool):
 
 
 @cli.command()
-@click.option("--paper", is_flag=True, default=True, help="Paper trading mode")
+@click.option("--paper", is_flag=True, default=False, help="Paper trading mode (add flag to simulate)")
 @click.option("--symbols", default="SPY,SPX", help="Comma-separated symbols")
 @click.option("--no-llm", is_flag=True, default=False, help="Disable LLM validation")
-def live(paper: bool, symbols: str, no_llm: bool):
+@click.option("--defined-risk", is_flag=True, default=False,
+              help="Iron condor mode — defined-risk wings, works in cash accounts")
+def live(paper: bool, symbols: str, no_llm: bool, defined_risk: bool):
     """Run bot in live (or paper) trading mode."""
     if not paper:
         click.confirm(
@@ -1306,6 +1326,7 @@ def live(paper: bool, symbols: str, no_llm: bool):
         paper_trading=paper,
         symbols=symbols.split(","),
         llm_enabled=not no_llm,
+        defined_risk=defined_risk,
     )
 
     mode_str = "PAPER" if paper else "LIVE ⚠️"
@@ -1333,6 +1354,401 @@ def logs(lines: int):
         tail = f.readlines()[-lines:]
     for line in tail:
         click.echo(line, nl=False)
+
+
+@cli.command()
+@click.option("--symbol",  default="SPY",  help="Symbol to scan (default SPY)")
+@click.option("--paper",   is_flag=True, default=False, help="Paper trade (no real orders)")
+@click.option("--cert",    is_flag=True, default=False, help="Use Tastytrade sandbox (cert env)")
+@click.option("--no-llm",  is_flag=True, default=False, help="Disable LLM gate")
+@click.option("--bp",      default=0.0, type=float, help="Override starting BP")
+def scan(symbol: str, paper: bool, cert: bool, no_llm: bool, bp: float):
+    """
+    0-1 DTE intraday scanner + executor.
+
+    Pulls live SPY price + options chain from Polygon every minute,
+    computes gamma walls, IV term structure, and runs ZeroDTEStrategy.
+    Every setup (traded or not) is logged to data/predictions.db
+    for self-calibrating Kelly sizing.
+
+    Example:
+        python -m src.main scan --symbol SPY --paper
+    """
+    config = BotConfig(
+        backtesting_mode=False,
+        paper_trading=paper or cert,
+        symbols=[symbol],
+        llm_enabled=not no_llm,
+    )
+    if bp > 0:
+        config.account_bp = bp
+
+    mode = "CERT/PAPER" if cert else ("PAPER" if paper else "LIVE")
+    logger.info(f"Starting ZeroDTE {mode} scan on {symbol}  BP=${config.account_bp:,.0f}")
+    asyncio.run(_run_scan(config, symbol, cert=cert))
+
+
+async def _run_scan(config: BotConfig, symbol: str, cert: bool = False) -> None:
+    """Intraday loop: fetch Polygon data every minute, run ZeroDTE pipeline."""
+    # --- Connectors ---
+    polygon = PolygonConnector()
+    tastytrade = TastytradeConnector(
+        username=config.tastytrade_username,
+        password=config.tastytrade_password,
+        cert=cert,
+    ) if config.tastytrade_username else None
+
+    await polygon.connect()
+    if tastytrade:
+        try:
+            await tastytrade.connect()
+        except Exception as e:
+            logger.warning(f"Tastytrade connect failed: {e} — execution disabled")
+            tastytrade = None
+
+    # --- Engines ---
+    gex_engine   = GammaExposureEngine()
+    iv_analyzer  = IVTermStructureAnalyzer()
+    pred_logger  = PredictionLogger()
+
+    # --- LLM ---
+    zdte_llm = None
+    if config.llm_enabled:
+        llm_client = LocalLLMClient(
+            base_url=config.llm_base_url,
+            model=config.llm_model,
+            timeout=config.llm_timeout,
+            temperature=config.llm_temperature,
+        )
+        zdte_llm = ZeroDTEReasoningEngine(llm_client)
+
+    # --- Strategies (all run in parallel, RuleEngine aggregates + deduplicates) ---
+    strategy   = ZeroDTEStrategy(account_bp=config.account_bp, risk_pct=config.max_risk_pct,
+                                  prediction_logger=pred_logger,
+                                  defined_risk=config.defined_risk)
+    orb_strat  = ORBStrategy(account_bp=config.account_bp, risk_pct=0.12)
+    vwap_strat = VWAPStrategy(account_bp=config.account_bp, risk_pct=0.12)
+    gap_strat  = GapFillStrategy(account_bp=config.account_bp, risk_pct=0.12)
+    mom_strat  = MomentumStrategy(account_bp=config.account_bp, risk_pct=0.12)
+    ivp_strat  = IVPercentileStrategy(account_bp=config.account_bp, risk_pct=0.10)
+    all_strategies = [strategy, orb_strat, vwap_strat, gap_strat, mom_strat, ivp_strat]
+
+    # --- Execution ---
+    # Paper mode: realistic fill simulation, no real orders sent.
+    # Live mode: routes through Tastytrade REST API using the authenticated connector.
+    if not tastytrade:
+        executor = PaperTradingExecutor(commission_per_contract=0.65, half_spread_bps=5.0)
+        logger.warning("Tastytrade not connected — paper executor only")
+    elif config.paper_trading:
+        # --paper flag: TastytradeExecutor in paper=True mode — simulates fills locally
+        executor = TastytradeExecutor(connector=tastytrade, paper=True)
+        logger.info("[TT] Paper executor — no real orders sent")
+    elif cert:
+        # --cert flag: real API calls go to cert.tastyworks.com (fake money)
+        executor = TastytradeExecutor(connector=tastytrade, paper=False)
+        logger.info("[TT] Cert/sandbox executor — orders hit Tastytrade paper env")
+    else:
+        executor = TastytradeExecutor(connector=tastytrade, paper=False)
+        logger.info("[TT] LIVE executor — real money, real orders")
+    portfolio = PortfolioManager(initial_cash=config.account_bp)
+    risk      = RiskMonitor(RiskLimits(
+        max_portfolio_delta=config.max_portfolio_delta,
+        max_portfolio_gamma=config.max_portfolio_gamma,
+        max_position_count=5,
+    ))
+    circuit   = CircuitBreaker(risk)
+
+    logger.info(f"[ZeroDTE] Scanning {symbol} — Ctrl+C to stop")
+
+    # Track open sell_strangle trades for TP monitoring.
+    # Key = trade_id, value = {call_pos_id, put_pos_id, call_strike, put_strike,
+    #                          entry_premium, iv_0dte}
+    _strangle_trades: dict = {}
+
+    try:
+        while True:
+            now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+
+            # Convert UTC → ET (EDT=UTC-4, EST=UTC-5) for regime/EOD checks
+            import calendar as _cal
+            def _edt(dt: datetime) -> bool:
+                y, mo, d = dt.year, dt.month, dt.day
+                first_day_mar = _cal.weekday(y, 3, 1)
+                sun2_mar = (6 - first_day_mar) % 7 + 1 + 7
+                first_day_nov = _cal.weekday(y, 11, 1)
+                sun1_nov = (6 - first_day_nov) % 7 + 1
+                return (mo > 3 or (mo == 3 and d >= sun2_mar)) and \
+                       (mo < 11 or (mo == 11 and d < sun1_nov))
+            et_offset = 4 if _edt(now_utc) else 5
+            now_et = now_utc.replace(
+                hour=(now_utc.hour - et_offset) % 24,
+                minute=now_utc.minute,
+            )
+            et_minutes = now_et.hour * 60 + now_et.minute
+
+            # Outside market hours: 9:30 AM – 3:55 PM ET
+            market_open  = 9 * 60 + 30   # 570
+            market_close = 15 * 60 + 55  # 955
+            if et_minutes < market_open or et_minutes >= market_close:
+                click.echo(
+                    f"[ZeroDTE] Market closed ({now_et.hour:02d}:{now_et.minute:02d} ET). "
+                    f"Run again during 9:30–3:55 ET."
+                )
+                break
+
+            # EOD: close all positions at 3:55 PM ET (0DTE expire at close)
+            if et_minutes >= market_close:
+                open_positions = [p for p in portfolio.positions.values()
+                                  if p.status == "open"]
+                if open_positions:
+                    logger.info(f"[EOD] {len(open_positions)} position(s) — closing at market")
+                    for pos in open_positions:
+                        close_px = pos.current_price if pos.current_price > 0 else 0.01
+                        pnl = portfolio.close_position(pos.position_id, close_px)
+                        strategy.on_expiry_resolution(pos.symbol, close_px, pnl or 0.0)
+                await asyncio.sleep(300)
+                continue
+
+            # Fetch current SPY price from Polygon (latest 1-min bar)
+            today = now_utc.strftime("%Y-%m-%d")
+            bars  = await polygon.get_bars(symbol, today, multiplier=1, timespan="minute")
+            if not bars:
+                await asyncio.sleep(15)
+                continue
+
+            bar  = bars[-1]
+            spot = bar.close
+            executor.set_market_price(symbol, spot)
+
+            # Fetch options chain with greeks + OI + volume
+            contracts = await polygon.get_options_snapshot(symbol, max_dte=7)
+            if not contracts:
+                logger.debug("[ZeroDTE] Empty options chain — waiting")
+                await asyncio.sleep(15)
+                continue
+
+            # Compute GEX walls (the core signal)
+            walls = gex_engine.find_walls(contracts, spot, max_distance_pct=0.04, top_n=6)
+
+            # IV term structure
+            term  = iv_analyzer.analyze(contracts, spot, max_dte=7)
+
+            if walls:
+                top = walls[0]
+                logger.info(
+                    f"[GEX] {symbol} ${spot:.2f}  "
+                    f"top wall: K={top.strike:.1f} {top.wall_type.upper()} "
+                    f"GEX=${top.net_gex_dollars/1e6:.2f}M  "
+                    f"confluence={top.confluence_score:.2f}  "
+                    f"strength={top.strength}"
+                )
+
+            if circuit.is_tripped:
+                logger.warning("[ZeroDTE] Circuit breaker active — no new trades")
+                await asyncio.sleep(60)
+                continue
+
+            available_bp = portfolio.cash
+            trade_date   = today
+            today_open   = bars[0].open if bars else spot
+
+            # Set daily context on all strategies (gap, date, IVR)
+            ivr = getattr(polygon, '_ivr_cache', {}).get(symbol, 50)
+            gap_pct = (today_open - getattr(_run_scan, '_prior_close', today_open)) / max(today_open, 1)
+            # Derive live VIX from TastyTrade SPY implied vol (SPY iv ≈ VIX/100).
+            # Falls back to 18 (conservative — won't wrongly block trades if unavailable).
+            live_vix = 18.0
+            try:
+                if tastytrade:
+                    tt_metrics = await tastytrade.get_market_metrics(symbol)
+                    spy_iv = tt_metrics.get(symbol, {}).get("iv")
+                    if spy_iv and spy_iv > 0:
+                        live_vix = spy_iv * 100.0
+            except Exception:
+                pass
+            strategy.set_daily_context(gap_pct=gap_pct, prior_close=getattr(_run_scan, '_prior_close', 0), vix=live_vix)
+            orb_strat.set_daily_context(trade_date)
+            vwap_strat.set_daily_context(trade_date)
+            gap_strat.set_daily_context(gap_pct, getattr(_run_scan, '_prior_close', 0), trade_date)
+            mom_strat.set_daily_context(trade_date)
+            ivp_strat.set_daily_context(ivr, trade_date)
+
+            # TP monitoring: buy-to-close sell_strangle when cost decays to 40% of entry
+            if _strangle_trades:
+                from src.backtest import bsm_call as _bsm_c, bsm_put as _bsm_p
+                _iv_0dte = live_vix / 100.0 * 1.15
+                _now_et_hr = now_et.hour + now_et.minute / 60.0
+                _T_now = max((16.0 - _now_et_hr) / 6.5 / 252.0, 0.5 / 365.0)
+                for _tid, _tr in list(_strangle_trades.items()):
+                    _call_pos = portfolio.positions.get(_tr["call_pos_id"])
+                    _put_pos  = portfolio.positions.get(_tr["put_pos_id"])
+                    if not _call_pos or not _put_pos:
+                        # One or both legs already closed externally (e.g., EOD sweep)
+                        _strangle_trades.pop(_tid, None)
+                        continue
+                    _cv = (_bsm_c(spot, _tr["call_strike"], _T_now, 0.05, _iv_0dte) +
+                           _bsm_p(spot, _tr["put_strike"],  _T_now, 0.05, _iv_0dte))
+                    _tp_threshold = _tr["entry_premium"] * 0.40
+                    if _cv <= _tp_threshold:
+                        logger.info(
+                            f"[TP] Strangle {_tid}: cost-to-close ${_cv:.3f} ≤ "
+                            f"40% of entry ${_tr['entry_premium']:.3f} — closing both legs"
+                        )
+                        pnl_c = portfolio.close_position(_tr["call_pos_id"], _cv / 2)
+                        pnl_p = portfolio.close_position(_tr["put_pos_id"],  _cv / 2)
+                        total_pnl = (pnl_c or 0.0) + (pnl_p or 0.0)
+                        logger.info(f"[TP] Strangle {_tid} closed — P&L ${total_pnl:.2f}")
+                        _strangle_trades.pop(_tid)
+
+            # Gather signals from all strategies
+            raw_signals = []
+            for strat in all_strategies:
+                try:
+                    if strat is strategy:
+                        sig = await strat.on_bar(bar, walls, term, available_bp)
+                    elif strat in (orb_strat, vwap_strat, mom_strat):
+                        sig = await strat.on_bar(bar, walls, term, available_bp, trade_date)
+                    elif strat is gap_strat:
+                        sig = await strat.on_bar(bar, walls, term, available_bp, trade_date, gap_pct,
+                                                  getattr(_run_scan, '_prior_close', 0))
+                    else:
+                        sig = await strat.on_bar(bar, walls, term, available_bp, trade_date, ivr)
+                    if sig:
+                        raw_signals.append(sig)
+                except Exception as _e:
+                    logger.debug(f"[{strat.name}] error: {_e}")
+
+            # Log all signals
+            for sig in raw_signals:
+                logger.info(
+                    f"[SIGNAL:{sig.strategy_name:12s}] {sig.signal_type.value.upper():16s} "
+                    f"K={sig.strike:.0f}  x{sig.position_size}  "
+                    f"play={sig.metadata.get('play_type','?').upper():12s}  "
+                    f"score={sig.metadata.get('condition_score',0):.0%}"
+                )
+
+            # Take the highest-confidence signal (LLM will re-rank when enabled)
+            signal = max(raw_signals, key=lambda s: s.confidence) if raw_signals else None
+
+            if signal:
+                logger.info(
+                    f"[SIGNAL] {signal.signal_type.value.upper():18s} "
+                    f"K={signal.strike:.0f}  x{signal.position_size}  "
+                    f"play={signal.metadata.get('play_type','?').upper()}  "
+                    f"score={signal.metadata.get('condition_score',0):.0%}  "
+                    f"DTE={signal.metadata.get('dte','?')}  "
+                    + (f"→ {signal.metadata['target_reasoning']}"
+                       if signal.metadata.get('target_reasoning') else "")
+                )
+                # LLM gate
+                approved = True
+                llm_conf = 0.0
+                if zdte_llm and signal.signal_type != SignalType.CLOSE_POSITION:
+                    from src.llm import ZeroDTEContext as _ZCtx
+                    vel    = strategy._velocity()
+                    decel  = strategy._deceleration()
+                    best_w = walls[0] if walls else None
+                    best_t = term[0]  if term  else None
+                    ctx = _ZCtx(
+                        symbol=symbol,
+                        timestamp=now_utc,
+                        spot=spot,
+                        wall_strike=signal.metadata.get("wall_strike", spot),
+                        wall_type=signal.metadata.get("wall_type", "pin"),
+                        net_gex_dollars=signal.metadata.get("net_gex_dollars", 0),
+                        confluence_score=signal.metadata.get("confluence_score", 0),
+                        dte=signal.metadata.get("dte", 0),
+                        atm_iv=signal.metadata.get("implied_vol", 0.20),
+                        iv_premium_vs_next=best_t.iv_premium_vs_next if best_t else 1.0,
+                        crush_probability=best_t.crush_probability if best_t else 0.0,
+                        expected_move_1sd=signal.metadata.get("expected_move", 0),
+                        velocity_pct=vel,
+                        deceleration=decel,
+                        play_type=signal.metadata.get("play_type", "pin"),
+                        condition_score=signal.metadata.get("condition_score", 0),
+                        kelly_contracts=signal.position_size,
+                        available_bp=available_bp,
+                    )
+                    decision = await zdte_llm.evaluate(ctx)
+                    llm_conf = decision.confidence
+                    if decision.action == "skip" or decision.confidence < zdte_llm.MIN_CONFIDENCE:
+                        approved = False
+                        logger.info(
+                            f"[LLM] SKIP {signal.signal_type.value}  "
+                            f"conf={decision.confidence:.0%}  {decision.key_risk}"
+                        )
+                    else:
+                        signal = signal.with_llm(
+                            size_multiplier=decision.size_multiplier,
+                            stop_loss=None,
+                            take_profit=None,
+                        )
+                        signal.metadata["llm_reasoning"]  = decision.reasoning
+                        signal.metadata["llm_confidence"] = llm_conf
+
+                if approved:
+                    orders = signal_to_orders(signal, spot)
+                    _is_strangle = signal.signal_type.value == "sell_strangle"
+                    _strangle_legs: dict = {}  # "call" / "put" → pos_id
+                    _strangle_leg_premiums: dict = {}
+                    for order in orders:
+                        oid = await executor.place_order(order)
+                        filled = executor.orders[oid]
+                        if filled.status.value == "filled":
+                            qty = filled.quantity if filled.side.value == "BUY" else -filled.quantity
+                            pos_obj = portfolio.open_position(
+                                symbol=filled.symbol,
+                                option_type=filled.option_type,
+                                strike=filled.strike,
+                                expiry=filled.expiry,
+                                quantity=qty,
+                                entry_price=filled.avg_fill_price,
+                                strategy_name="ZeroDTE",
+                                signal_type=signal.signal_type.value,
+                                llm_reasoning=signal.metadata.get("llm_reasoning", ""),
+                            )
+                            if _is_strangle and pos_obj:
+                                _strangle_legs[filled.option_type] = pos_obj.position_id
+                                _strangle_leg_premiums[filled.option_type] = filled.avg_fill_price
+                    if _is_strangle and "call" in _strangle_legs and "put" in _strangle_legs:
+                        _tid = f"{today}_{signal.strike:.0f}"
+                        _iv_now = live_vix / 100.0 * 1.15
+                        _strangle_trades[_tid] = {
+                            "call_pos_id":   _strangle_legs["call"],
+                            "put_pos_id":    _strangle_legs["put"],
+                            "call_strike":   float(signal.metadata.get("call_strike", signal.strike + 3)),
+                            "put_strike":    float(signal.metadata.get("put_strike",  signal.strike - 3)),
+                            "entry_premium": (_strangle_leg_premiums.get("call", 0) +
+                                              _strangle_leg_premiums.get("put",  0)),
+                            "iv_0dte":       _iv_now,
+                        }
+                        logger.info(
+                            f"[STRANGLE] Registered trade {_tid}: "
+                            f"entry_premium=${_strangle_trades[_tid]['entry_premium']:.3f}  "
+                            f"TP at ${_strangle_trades[_tid]['entry_premium'] * 0.40:.3f}"
+                        )
+                    portfolio.snapshot()
+
+            await asyncio.sleep(60)  # 1-minute loop
+
+    except KeyboardInterrupt:
+        logger.info("[ZeroDTE] Stopped by user")
+    finally:
+        portfolio.print_report()
+        pred_stats = pred_logger.get_accuracy_stats()
+        if pred_stats:
+            logger.info("[PredictionLogger] Accuracy stats:")
+            for play, st in pred_stats.items():
+                logger.info(
+                    f"  {play:12s}  accuracy={st['accuracy']:.0%}  "
+                    f"avg_pnl=${st['avg_pnl']:.2f}  n={st['traded_count']}"
+                )
+        pred_logger.close()
+        await polygon.disconnect()
+        if tastytrade:
+            await tastytrade.disconnect()
+        if zdte_llm:
+            await zdte_llm.client.close()
 
 
 @cli.command()
@@ -1366,18 +1782,19 @@ def llm_check():
 
 
 @cli.command("tastytrade-check")
-def tastytrade_check():
+@click.option("--cert", is_flag=True, default=False, help="Use cert/sandbox environment")
+def tastytrade_check(cert: bool):
     """
     Test the Tastytrade API connection.
 
     Prints: connection status, account list, and current SPY / SPX IV metrics.
-    Requires TASTYTRADE_USERNAME and TASTYTRADE_PASSWORD in .env.
 
     Usage:
         python -m src.main tastytrade-check
+        python -m src.main tastytrade-check --cert
     """
     async def _check():
-        connector = TastytradeConnector()
+        connector = TastytradeConnector(cert=cert)
 
         click.echo("\n" + "=" * 60)
         click.echo("  TASTYTRADE CONNECTION CHECK")
@@ -1467,6 +1884,42 @@ def tastytrade_check():
         click.echo("[OK] Disconnected cleanly\n")
 
     asyncio.run(_check())
+
+
+@cli.command("backtest")
+@click.option("--symbol",       default="SPY",   show_default=True)
+@click.option("--start",        default=None,    help="YYYY-MM-DD (default: 90 days ago)")
+@click.option("--end",          default=None,    help="YYYY-MM-DD (default: yesterday)")
+@click.option("--capital",      default=2500.0,  type=float, show_default=True)
+@click.option("--defined-risk", is_flag=True, default=False,
+              help="Use iron condors (defined-risk wings) instead of naked strangles")
+def backtest(symbol: str, start: str, end: str, capital: float, defined_risk: bool):
+    """
+    Backtest ZeroDTE strategy on real Polygon bars + synthetic GEX/IV.
+
+    Usage:
+        python -m src.main backtest
+        python -m src.main backtest --start 2025-01-01 --end 2025-12-31
+        python -m src.main backtest --symbol SPY --capital 1000 --defined-risk
+    """
+    from src.backtest import BacktestEngine, BacktestReporter
+
+    if end is None:
+        end = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    if start is None:
+        start = (datetime.now() - timedelta(days=91)).strftime("%Y-%m-%d")
+
+    async def _run():
+        polygon = PolygonConnector()
+        await polygon.connect()
+
+        engine = BacktestEngine(polygon, initial_capital=capital, defined_risk=defined_risk)
+        result = await engine.run(symbol, start, end)
+        await polygon.disconnect()
+
+        BacktestReporter.print(result)
+
+    asyncio.run(_run())
 
 
 if __name__ == "__main__":

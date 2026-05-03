@@ -502,52 +502,81 @@ class TradeReasoningEngine:
 
     def _heuristic_decision(self, ctx: TradeContext) -> LLMTradeDecision:
         """
-        Rule-based fallback. Uses IV/RV ratio as primary signal quality filter.
-        Mirrors institutional desk heuristics for vol strategies.
+        Strict IV/RV quality gate. The regime engine does primary filtering;
+        the heuristic acts as a final edge-quality check.
+
+        Buy straddles only when IV is genuinely cheap vs realized vol (iv_rv < 1.10).
+        Sell condors only when IV is genuinely rich vs realized vol (iv_rv > 1.45).
+        The 1.10 / 1.45 thresholds represent real edge — between them is fair value.
+
+        In crash/trending_bear regimes: relax sell requirement (no condors anyway due
+        to sell_threshold=999) and focus on vol-buying quality.
         """
+        from src.strategy import _REGIME_PARAMS
+
         sig = (ctx.signal_type or "").lower()
         iv_rv = ctx.implied_vol / max(ctx.realized_vol, 0.001)
+        regime_key = ctx.market_regime or "elevated_vol"
+        rp = _REGIME_PARAMS.get(regime_key, _REGIME_PARAMS["elevated_vol"])
 
         # --- Vol buying strategies (straddle, strangle, calendar) ---
         if any(k in sig for k in ("straddle", "strangle", "calendar", "buy_call", "buy_put")):
-            if iv_rv < 1.1 and ctx.iv_percentile < 30:
+            # In crash/bear regimes, be slightly more lenient on the buy threshold
+            # (IV hasn't spiked to full RV yet but will)
+            buy_iv_rv_max = 1.30 if regime_key in ("crash", "trending_bear") else 1.10
+            if iv_rv <= buy_iv_rv_max and ctx.iv_percentile < rp["buy_threshold"]:
                 return LLMTradeDecision(
                     action="enter",
-                    confidence=0.65,
+                    confidence=0.72,
                     position_size_multiplier=1.0,
-                    reasoning=f"[heuristic] IV/RV={iv_rv:.2f}x and IV%ile={ctx.iv_percentile:.0f} — vol is cheap, buying justified.",
+                    reasoning=(
+                        f"[heuristic] {regime_key}: IV/RV={iv_rv:.2f}x ≤ {buy_iv_rv_max:.2f} "
+                        f"and IV%ile={ctx.iv_percentile:.0f} < {rp['buy_threshold']:.0f} — vol cheap, buying justified."
+                    ),
                     key_risks=["vol could stay suppressed", "theta decay if no move"],
                     suggested_stop_loss=0.50,
-                    suggested_take_profit=1.00,
+                    suggested_take_profit=rp["take_profit_pct"],
                     source="heuristic",
                 )
             return LLMTradeDecision(
                 action="skip",
                 confidence=0.6,
                 position_size_multiplier=0.0,
-                reasoning=f"[heuristic] IV/RV={iv_rv:.2f}x — vol not cheap enough to justify buying.",
+                reasoning=(
+                    f"[heuristic] {regime_key}: IV/RV={iv_rv:.2f}x (max={buy_iv_rv_max:.2f}) "
+                    f"or IV%ile={ctx.iv_percentile:.0f} ≥ {rp['buy_threshold']:.0f} — vol not cheap enough to buy."
+                ),
                 key_risks=["overpaying for premium"],
                 source="heuristic",
             )
 
-        # --- Vol selling strategies (iron condor, short strangle) ---
+        # --- Vol selling strategies (iron condor, butterfly, short strangle) ---
         if any(k in sig for k in ("iron_condor", "butterfly", "sell_call", "sell_put")):
-            if iv_rv > 1.5 and ctx.iv_percentile > 70:
+            # Require genuine IV premium: iv_rv > 1.45 — this is where condors have edge.
+            # Regime already filtered to iv_rv > 1.30 (calm_bull) or 1.45 (elevated).
+            sell_iv_rv_min = max(rp["iv_rv_sell_min"], 1.40)
+            if iv_rv >= sell_iv_rv_min and ctx.iv_percentile > rp["sell_threshold"]:
                 return LLMTradeDecision(
                     action="enter",
-                    confidence=0.70,
+                    confidence=0.75,
                     position_size_multiplier=1.0,
-                    reasoning=f"[heuristic] IV/RV={iv_rv:.2f}x and IV%ile={ctx.iv_percentile:.0f} — vol is rich, selling justified.",
+                    reasoning=(
+                        f"[heuristic] {regime_key}: IV/RV={iv_rv:.2f}x ≥ {sell_iv_rv_min:.2f} "
+                        f"and IV%ile={ctx.iv_percentile:.0f} > {rp['sell_threshold']:.0f} — premium rich, selling justified."
+                    ),
                     key_risks=["gap risk", "gamma spike near expiry", "earnings surprise"],
-                    suggested_stop_loss=2.0,  # Close at 200% of premium received
-                    suggested_take_profit=0.5,
+                    suggested_stop_loss=rp["stop_loss_mult"],
+                    suggested_take_profit=rp["take_profit_pct"],
                     source="heuristic",
                 )
             return LLMTradeDecision(
                 action="skip",
                 confidence=0.6,
                 position_size_multiplier=0.0,
-                reasoning=f"[heuristic] IV/RV={iv_rv:.2f}x — premium not rich enough to sell.",
+                reasoning=(
+                    f"[heuristic] {regime_key}: IV/RV={iv_rv:.2f}x (min={sell_iv_rv_min:.2f}) "
+                    f"or IV%ile={ctx.iv_percentile:.0f} ≤ {rp['sell_threshold']:.0f} — premium not rich enough to sell."
+                ),
                 key_risks=["risk/reward unfavorable"],
                 source="heuristic",
             )
@@ -573,7 +602,7 @@ class TradeReasoningEngine:
         )
 
     @staticmethod
-    def _heuristic_regime(returns: List[float], iv_history: List[float]) -> RegimeAnalysis:
+    def _heuristic_regime(returns: List[float], iv_history: List[float]) -> RegimeAnalysis:  # noqa: E303
         import numpy as np
 
         if not returns or len(returns) < 5:
@@ -602,4 +631,217 @@ class TradeReasoningEngine:
         return RegimeAnalysis(
             regime=regime, confidence=0.6, strength=strength,
             key_observation=obs, source="heuristic"
+        )
+
+
+# ============================================================================
+# ZERO-DTE REASONING ENGINE
+# ============================================================================
+
+
+@dataclass
+class ZeroDTEContext:
+    """Structured context snapshot for 0DTE setup evaluation."""
+
+    symbol: str
+    timestamp: datetime
+    spot: float
+
+    # GEX / wall data
+    wall_strike: float
+    wall_type: str              # 'pin' | 'explosive'
+    net_gex_dollars: float
+    confluence_score: float     # 0-1
+
+    # IV term structure
+    dte: int
+    atm_iv: float
+    iv_premium_vs_next: float   # ratio of this DTE's IV vs next DTE out
+    crush_probability: float    # 0-1
+    expected_move_1sd: float    # $
+
+    # Price behavior
+    velocity_pct: float         # recent price velocity fraction
+    deceleration: float         # positive = slowing (good for pin)
+
+    # Play type chosen by quant layer
+    play_type: str              # 'pin' | 'explosive' | 'iv_crush'
+    condition_score: float      # 0-1 weighted setup score
+    kelly_contracts: int
+
+    # Portfolio state
+    portfolio_delta: float = 0.0
+    portfolio_gamma: float = 0.0
+    available_bp: float = 0.0
+    open_positions: int = 0
+
+    # Call/put volume ratio at wall strike
+    call_put_volume_ratio: float = 1.0  # >1 = more calls, <1 = more puts
+
+
+@dataclass
+class ZeroDTEDecision:
+    """Decisive LLM output for a 0DTE setup."""
+    action: str              # 'enter' | 'skip'
+    confidence: float        # 0.0-1.0
+    size_multiplier: float   # applied to kelly_contracts (0.5 = half size)
+    reasoning: str           # ≤2 sentences
+    key_risk: str            # single biggest risk
+    source: str = "llm"      # 'llm' | 'heuristic'
+
+
+_ZDTE_SYSTEM = """\
+You are a decisive 0DTE options trader. You receive pre-computed quant signals.
+Your ONLY job: confirm or reject the trade based on whether the edge is real.
+Rules:
+- Respond ONLY with valid JSON matching the schema exactly.
+- Be binary: if the edge is marginal, action = "skip".
+- Never add commentary outside the JSON.
+- Trust the GEX data — gamma walls are real market structure."""
+
+
+def _zdteprompt(ctx: ZeroDTEContext) -> str:
+    gex_m = ctx.net_gex_dollars / 1_000_000
+    return f"""\
+0DTE SETUP EVALUATION — {ctx.symbol} @ ${ctx.spot:.2f}
+Time: {ctx.timestamp.strftime('%H:%M ET')}  DTE: {ctx.dte}
+
+GEX WALL:
+  Strike: {ctx.wall_strike:.1f}  Type: {ctx.wall_type.upper()}
+  Net GEX: ${gex_m:+.2f}M  Confluence: {ctx.confluence_score:.2f}/1.0
+
+IV STRUCTURE:
+  ATM IV: {ctx.atm_iv:.1%}  IV vs next DTE: {ctx.iv_premium_vs_next:.2f}×
+  Crush probability: {ctx.crush_probability:.0%}
+  Expected 1σ move: ${ctx.expected_move_1sd:.2f}
+
+PRICE BEHAVIOR:
+  Velocity: {ctx.velocity_pct:+.3%}/bar  Deceleration: {ctx.deceleration:+.2f}
+  Call/Put vol ratio at wall: {ctx.call_put_volume_ratio:.2f}
+
+QUANT RECOMMENDATION:
+  Play: {ctx.play_type.upper()}
+  Setup score: {ctx.condition_score:.2f}/1.00  (threshold 0.65)
+  Kelly size: {ctx.kelly_contracts} contract(s)
+
+PORTFOLIO:
+  Delta: {ctx.portfolio_delta:.1f}  Gamma: {ctx.portfolio_gamma:.4f}
+  Available BP: ${ctx.available_bp:,.0f}  Open positions: {ctx.open_positions}
+
+Question: Does this setup have genuine edge, or is it marginal noise?
+
+Respond ONLY with this JSON (no markdown):
+{{
+  "action": "enter" | "skip",
+  "confidence": <float 0.0-1.0>,
+  "size_multiplier": <float 0.5-1.5>,
+  "reasoning": "<max 2 sentences>",
+  "key_risk": "<single biggest risk in ≤10 words>"
+}}"""
+
+
+class ZeroDTEReasoningEngine:
+    """
+    LLM gate for 0DTE setups.
+
+    Receives pre-computed quant signals (GEX, IV term structure, condition score)
+    and returns a binary enter/skip decision with confidence.
+
+    The LLM is NOT doing the math — that's already done. It's doing a sanity
+    check: does everything cohere? Is there a reason to doubt the setup?
+
+    Fallback: if LLM is unavailable, uses a simple heuristic (condition_score
+    threshold + crush_probability) so the bot never goes dark.
+    """
+
+    MIN_CONFIDENCE = 0.65
+
+    def __init__(self, client: LocalLLMClient, fallback_on_error: bool = True):
+        self.client = client
+        self.fallback_on_error = fallback_on_error
+        self._available: Optional[bool] = None
+        self._checked_at: float = 0.0
+        logger.info("ZeroDTEReasoningEngine initialized")
+
+    async def evaluate(self, ctx: ZeroDTEContext) -> ZeroDTEDecision:
+        """Evaluate a 0DTE setup. Always returns a valid decision — never raises."""
+        if not await self._is_available():
+            return self._heuristic(ctx)
+
+        messages = [
+            {"role": "system", "content": _ZDTE_SYSTEM},
+            {"role": "user",   "content": _zdteprompt(ctx)},
+        ]
+        raw = await self.client.chat(messages, json_mode=True)
+        if raw is None:
+            return self._heuristic(ctx)
+
+        try:
+            text = raw.strip()
+            if text.startswith("```"):
+                text = "\n".join(text.split("\n")[1:]).rstrip("`").strip()
+            data = json.loads(text)
+            dec = ZeroDTEDecision(
+                action=data.get("action", "skip"),
+                confidence=float(data.get("confidence", 0.5)),
+                size_multiplier=float(data.get("size_multiplier", 1.0)),
+                reasoning=data.get("reasoning", ""),
+                key_risk=data.get("key_risk", ""),
+                source="llm",
+            )
+            logger.info(
+                f"[ZeroDTE-LLM] {ctx.play_type} {ctx.symbol} K={ctx.wall_strike:.1f} "
+                f"→ {dec.action.upper()} conf={dec.confidence:.0%} | {dec.key_risk}"
+            )
+            return dec
+        except (json.JSONDecodeError, KeyError, ValueError) as exc:
+            logger.warning(f"[ZeroDTE-LLM] parse error: {exc}  raw={raw[:200]}")
+            return self._heuristic(ctx)
+
+    async def _is_available(self) -> bool:
+        if self.client is None:
+            return False
+        now = time.monotonic()
+        if self._available is None or (
+            not self._available and now - self._checked_at > 60.0
+        ):
+            self._available = await self.client.is_available()
+            self._checked_at = now
+        return bool(self._available)
+
+    def _heuristic(self, ctx: ZeroDTEContext) -> ZeroDTEDecision:
+        """
+        Fallback when LLM is down.
+        Enter if condition_score ≥ 0.65 AND there is genuine IV/GEX edge.
+        """
+        has_gex_edge  = abs(ctx.net_gex_dollars) >= 500_000
+        has_iv_edge   = ctx.crush_probability >= 0.25 or ctx.iv_premium_vs_next >= 1.10
+        score_ok      = ctx.condition_score >= 0.65
+
+        if score_ok and has_gex_edge and has_iv_edge:
+            return ZeroDTEDecision(
+                action="enter",
+                confidence=min(ctx.condition_score, 0.78),
+                size_multiplier=1.0,
+                reasoning=(
+                    f"[heuristic] {ctx.play_type}: GEX ${ctx.net_gex_dollars/1e6:.1f}M "
+                    f"confluence={ctx.confluence_score:.2f} score={ctx.condition_score:.2f}"
+                ),
+                key_risk="GEX wall breaks intraday",
+                source="heuristic",
+            )
+        reason = []
+        if not score_ok:
+            reason.append(f"score {ctx.condition_score:.2f} < 0.65")
+        if not has_gex_edge:
+            reason.append(f"|GEX| ${abs(ctx.net_gex_dollars)/1e6:.1f}M < $0.5M")
+        if not has_iv_edge:
+            reason.append(f"IV premium {ctx.iv_premium_vs_next:.2f}× / crush {ctx.crush_probability:.0%}")
+        return ZeroDTEDecision(
+            action="skip",
+            confidence=0.6,
+            size_multiplier=0.0,
+            reasoning=f"[heuristic] Marginal setup: {'; '.join(reason)}",
+            key_risk="insufficient edge",
+            source="heuristic",
         )
