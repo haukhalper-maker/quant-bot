@@ -267,10 +267,12 @@ class BacktestEngine:
     RATE_LIMIT_S = 0.4 # seconds between Polygon requests (stays under 5/min free tier)
     R = 0.05
 
-    def __init__(self, polygon, initial_capital: float = 2500.0, defined_risk: bool = False):
+    def __init__(self, polygon, initial_capital: float = 2500.0,
+                 defined_risk: bool = False, use_yfinance: bool = False):
         self._polygon = polygon
         self._capital = initial_capital
         self._defined_risk = defined_risk
+        self._use_yfinance = use_yfinance
         self._builder = SyntheticMarketBuilder()
 
     async def run(self, symbol: str, start: str, end: str) -> BacktestResult:
@@ -296,24 +298,30 @@ class BacktestEngine:
             "Momentum": MomentumStrategy(account_bp=self._capital, risk_pct=0.12),
             "IVPct":    IVPercentileStrategy(account_bp=self._capital, risk_pct=0.10),
         }
-        prior_close = 0.0
+        prior_close  = 0.0
+        running_capital = self._capital  # tracks P&L so Kelly sizing scales up/down
 
         for trade_date in trading_days:
             await asyncio.sleep(self.RATE_LIMIT_S)
-            bars = await self._fetch_bars_with_retry(symbol, trade_date)
+            if self._use_yfinance:
+                bars = self._fetch_bars_yf(symbol, trade_date)
+            else:
+                bars = await self._fetch_bars_with_retry(symbol, trade_date)
             if not bars:
                 continue
 
             market_bars = [b for b in bars if self._is_market_hours(b.timestamp)]
-            if len(market_bars) < 30:
+            if len(market_bars) < 2:
                 continue
 
             today_open = market_bars[0].open
             gap_pct    = (today_open - prior_close) / prior_close if prior_close > 0 else 0.0
             vix        = vix_by_date.get(trade_date) or self._estimate_vix(market_bars)
-            ivr        = min(int(vix * 2.2), 99)  # rough IVR proxy from VIX level
+            ivr        = min(int(vix * 2.2), 99)
 
-            # Set daily context on all strategies
+            # Update strategy BP to reflect running capital so sizing grows with wins
+            strategies["ZeroDTE"].update_bp(running_capital)
+
             s = strategies
             s["ZeroDTE"].set_daily_context(gap_pct=gap_pct, prior_close=prior_close, vix=vix)
             s["ORB"].set_daily_context(trade_date)
@@ -328,6 +336,7 @@ class BacktestEngine:
 
             result.daily_pnl[trade_date] = trade.pnl if trade else 0.0
             if trade:
+                running_capital = max(running_capital + trade.pnl, 100.0)
                 result.trades.append(trade)
                 logger.info(
                     f"  {trade_date}  VIX={vix:.1f}  {trade.play_type:10s}  "
@@ -618,12 +627,79 @@ class BacktestEngine:
                 for r in resp.json().get("results", []):
                     dt = datetime.utcfromtimestamp(r["t"] / 1000).strftime("%Y-%m-%d")
                     out[dt] = float(r["c"])
-                logger.info(f"[Backtest] VIX: {len(out)} days loaded")
+                logger.info(f"[Backtest] VIX: {len(out)} days loaded from Polygon")
                 return out
-            logger.warning(f"[Backtest] VIX HTTP {resp.status_code} — will estimate from bars")
+        except Exception:
+            pass
+        # Fallback: yfinance ^VIX — free, unlimited history
+        return self._fetch_vix_yf(start, end)
+
+    @staticmethod
+    def _fetch_vix_yf(start: str, end: str) -> Dict[str, float]:
+        try:
+            import yfinance as yf
+            df = yf.download("^VIX", start=start, end=end,
+                             auto_adjust=False, progress=False)
+            if df.empty:
+                return {}
+            out = {}
+            for idx, row in df.iterrows():
+                try:
+                    close = float(row["Close"].iloc[0]) if hasattr(row["Close"], "iloc") else float(row["Close"])
+                    out[str(idx.date())] = close
+                except Exception:
+                    continue
+            logger.info(f"[Backtest] VIX: {len(out)} days loaded from yfinance")
+            return out
         except Exception as e:
-            logger.warning(f"[Backtest] VIX fetch error: {e} — will estimate from bars")
-        return {}
+            logger.warning(f"[Backtest] VIX yfinance error: {e}")
+            return {}
+
+    def _fetch_bars_yf(self, symbol: str, date: str) -> List:
+        """
+        Fetch daily bar from yfinance and convert to two synthetic Candles
+        (open bar + close bar) so the backtest loop has something to process.
+        Enables stress-testing 2018-2022 without paid Polygon history.
+        """
+        try:
+            import yfinance as yf
+            from datetime import timedelta as _td
+            end_dt = (datetime.strptime(date, "%Y-%m-%d") + _td(days=1)).strftime("%Y-%m-%d")
+            df = yf.download(symbol, start=date, end=end_dt,
+                             interval="1d", auto_adjust=False, progress=False)
+            if df.empty:
+                return []
+
+            row = df.iloc[0]
+            def _v(x):
+                return float(x.iloc[0]) if hasattr(x, "iloc") else float(x)
+
+            open_p  = _v(row["Open"])
+            high_p  = _v(row["High"])
+            low_p   = _v(row["Low"])
+            close_p = _v(row["Close"])
+            volume  = int(_v(row["Volume"]))
+
+            # Build two synthetic candles: open (10:00 ET) and close (15:45 ET)
+            base = datetime.strptime(date, "%Y-%m-%d")
+            open_ts  = base.replace(hour=14, minute=0)   # 10:00 ET = 14:00 UTC
+            close_ts = base.replace(hour=19, minute=45)  # 15:45 ET = 19:45 UTC
+
+            Candle = self._candle_cls()
+            return [
+                Candle(symbol=symbol, timestamp=open_ts,
+                       open=open_p, high=high_p, low=low_p, close=open_p, volume=volume),
+                Candle(symbol=symbol, timestamp=close_ts,
+                       open=open_p, high=high_p, low=low_p, close=close_p, volume=volume),
+            ]
+        except Exception as e:
+            logger.warning(f"[Backtest] yfinance bars error {date}: {e}")
+            return []
+
+    def _candle_cls(self):
+        """Return the Candle dataclass used by this engine."""
+        from src.market_data import Candle
+        return Candle
 
     @staticmethod
     def _estimate_vix(bars: List[Candle]) -> float:
@@ -650,7 +726,8 @@ class BacktestEngine:
     @staticmethod
     def _is_market_hours(ts: datetime) -> bool:
         et = ts.hour * 60 + ts.minute - 4 * 60  # UTC → EDT approx
-        return 9 * 60 + 30 <= et < 15 * 60 + 55
+        # yfinance synthetic bars land at 14:00 and 19:45 UTC (10:00 / 15:45 ET)
+        return 9 * 60 + 30 <= et < 16 * 60
 
     @staticmethod
     def _et_hour(ts: datetime) -> float:

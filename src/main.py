@@ -1893,14 +1893,17 @@ def tastytrade_check(cert: bool):
 @click.option("--capital",      default=2500.0,  type=float, show_default=True)
 @click.option("--defined-risk", is_flag=True, default=False,
               help="Use iron condors (defined-risk wings) instead of naked strangles")
-def backtest(symbol: str, start: str, end: str, capital: float, defined_risk: bool):
+@click.option("--yfinance",     is_flag=True, default=False,
+              help="Use yfinance bars + VIX (free, unlimited history — enables 2018-2022 stress tests)")
+def backtest(symbol: str, start: str, end: str, capital: float,
+             defined_risk: bool, yfinance: bool):
     """
-    Backtest ZeroDTE strategy on real Polygon bars + synthetic GEX/IV.
+    Backtest ZeroDTE strategy.
 
-    Usage:
-        python -m src.main backtest
-        python -m src.main backtest --start 2025-01-01 --end 2025-12-31
-        python -m src.main backtest --symbol SPY --capital 1000 --defined-risk
+    Real Polygon bars (default) or yfinance for extended history:
+        python -m src.main backtest --capital 1000 --defined-risk
+        python -m src.main backtest --capital 1000 --defined-risk --yfinance --start 2020-01-01 --end 2020-12-31
+        python -m src.main backtest --capital 1000 --defined-risk --yfinance --start 2022-01-01 --end 2022-12-31
     """
     from src.backtest import BacktestEngine, BacktestReporter
 
@@ -1911,11 +1914,14 @@ def backtest(symbol: str, start: str, end: str, capital: float, defined_risk: bo
 
     async def _run():
         polygon = PolygonConnector()
-        await polygon.connect()
+        if not yfinance:
+            await polygon.connect()
 
-        engine = BacktestEngine(polygon, initial_capital=capital, defined_risk=defined_risk)
+        engine = BacktestEngine(polygon, initial_capital=capital,
+                                defined_risk=defined_risk, use_yfinance=yfinance)
         result = await engine.run(symbol, start, end)
-        await polygon.disconnect()
+        if not yfinance:
+            await polygon.disconnect()
 
         BacktestReporter.print(result)
 

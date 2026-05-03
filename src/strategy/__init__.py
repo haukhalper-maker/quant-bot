@@ -2030,28 +2030,38 @@ class ZeroDTEStrategy(Strategy):
 
         return s
 
+    def update_bp(self, new_bp: float) -> None:
+        """Update account buying power — called by backtest after each trade."""
+        self.account_bp = max(new_bp, 100.0)
+
+    def _dynamic_risk_pct(self) -> float:
+        """Scale risk from 40% at $1k down to 15% at $10k, linear."""
+        bp = self.account_bp
+        if bp <= 1_000:   return 0.40
+        if bp >= 10_000:  return 0.15
+        t = (bp - 1_000) / 9_000.0
+        return 0.40 - t * 0.25
+
     def _kelly_contracts(
         self,
         premium: float,
         play_type: PlayType,
         win_rate: float,
     ) -> int:
-        """Kelly criterion → contracts, capped at 8% of BP."""
-        # b = reward/risk ratio (profit per unit risked).
-        # 0DTE calls/puts can 3-10x on a strong move → use conservative 2.5x target.
-        # Kelly_f = (p*b - q) / b. At 50% win: PIN=0%, EXPLOSIVE=30%, IV_CRUSH=0% → all clip to 25% max.
+        """Kelly criterion → contracts, risk scales dynamically with account size."""
         payoff_map = {
-            PlayType.PIN:      (0.50, 2.0),   # sell strangle: collect credit, risk 2x if blown
-            PlayType.EXPLOSIVE:(2.50, 1.0),   # buy 0DTE: target 2.5x on good move, risk 100% of premium
-            PlayType.IV_CRUSH: (0.40, 2.0),   # sell straddle: collect credit, risk 2x if pin broken
+            PlayType.PIN:      (0.50, 2.0),
+            PlayType.EXPLOSIVE:(2.50, 1.0),
+            PlayType.IV_CRUSH: (0.40, 2.0),
         }
         tp_frac, sl_mult = payoff_map[play_type]
         p, q = win_rate, 1.0 - win_rate
         b = tp_frac
         kelly_f = float(np.clip((p * b - q) / b, 0.0, 0.25))
 
-        max_risk    = self.account_bp * self.risk_pct
-        kelly_risk  = kelly_f * self.account_bp
+        risk_pct     = self._dynamic_risk_pct()
+        max_risk     = self.account_bp * risk_pct
+        kelly_risk   = kelly_f * self.account_bp
         risk_dollars = min(max_risk, kelly_risk)
 
         risk_per_contract = sl_mult * premium * 100
@@ -2059,9 +2069,11 @@ class ZeroDTEStrategy(Strategy):
             return 1
 
         n = int(risk_dollars / risk_per_contract)
-        # Hard cap: SPY strangle margin ~$10k/contract; keep liquidity realistic.
-        # Scales with account: $25k→2, $50k→4, $100k→8, $250k→10 (ceiling).
-        liquidity_cap = max(2, min(10, int(self.account_bp / 25_000) * 2))
+        # Iron condors: max loss = wing width (~$500); naked: margin ~$10k+
+        if self.defined_risk:
+            liquidity_cap = max(1, min(10, int(self.account_bp / 500)))
+        else:
+            liquidity_cap = max(2, min(10, int(self.account_bp / 25_000) * 2))
         return max(1, min(n, liquidity_cap))
 
     @staticmethod
