@@ -1357,12 +1357,14 @@ def logs(lines: int):
 
 
 @cli.command()
-@click.option("--symbol",  default="SPY",  help="Symbol to scan (default SPY)")
-@click.option("--paper",   is_flag=True, default=False, help="Paper trade (no real orders)")
-@click.option("--cert",    is_flag=True, default=False, help="Use Tastytrade sandbox (cert env)")
-@click.option("--no-llm",  is_flag=True, default=False, help="Disable LLM gate")
-@click.option("--bp",      default=0.0, type=float, help="Override starting BP")
-def scan(symbol: str, paper: bool, cert: bool, no_llm: bool, bp: float):
+@click.option("--symbol",   default="SPY",  help="Symbol to scan (default SPY)")
+@click.option("--paper",    is_flag=True, default=False, help="Paper trade (no real orders)")
+@click.option("--cert",     is_flag=True, default=False, help="Use Tastytrade sandbox (cert env)")
+@click.option("--no-llm",   is_flag=True, default=False, help="Disable LLM gate")
+@click.option("--bp",       default=0.0, type=float, help="Override starting BP")
+@click.option("--yfinance", is_flag=True, default=False,
+              help="Use yfinance for bars instead of Polygon (free, no API key needed)")
+def scan(symbol: str, paper: bool, cert: bool, no_llm: bool, bp: float, yfinance: bool):
     """
     0-1 DTE intraday scanner + executor.
 
@@ -1371,8 +1373,10 @@ def scan(symbol: str, paper: bool, cert: bool, no_llm: bool, bp: float):
     Every setup (traded or not) is logged to data/predictions.db
     for self-calibrating Kelly sizing.
 
+    Use --yfinance if you don't have a paid Polygon plan (free bars, no GEX walls).
+
     Example:
-        python -m src.main scan --symbol SPY --paper
+        python -m src.main scan --symbol SPY --paper --yfinance
     """
     config = BotConfig(
         backtesting_mode=False,
@@ -1385,11 +1389,12 @@ def scan(symbol: str, paper: bool, cert: bool, no_llm: bool, bp: float):
 
     mode = "CERT/PAPER" if cert else ("PAPER" if paper else "LIVE")
     logger.info(f"Starting ZeroDTE {mode} scan on {symbol}  BP=${config.account_bp:,.0f}")
-    asyncio.run(_run_scan(config, symbol, cert=cert))
+    asyncio.run(_run_scan(config, symbol, cert=cert, use_yfinance=yfinance))
 
 
-async def _run_scan(config: BotConfig, symbol: str, cert: bool = False) -> None:
-    """Intraday loop: fetch Polygon data every minute, run ZeroDTE pipeline."""
+async def _run_scan(config: BotConfig, symbol: str, cert: bool = False,
+                    use_yfinance: bool = False) -> None:
+    """Intraday loop: fetch price + options data every minute, run ZeroDTE pipeline."""
     # --- Connectors ---
     polygon = PolygonConnector()
     tastytrade = TastytradeConnector(
@@ -1509,23 +1514,51 @@ async def _run_scan(config: BotConfig, symbol: str, cert: bool = False) -> None:
                 await asyncio.sleep(300)
                 continue
 
-            # Fetch current SPY price from Polygon (latest 1-min bar)
+            # Fetch current price bar
             today = now_utc.strftime("%Y-%m-%d")
-            bars  = await polygon.get_bars(symbol, today, multiplier=1, timespan="minute")
-            if not bars:
+            bar = None
+            if use_yfinance:
+                try:
+                    import yfinance as _yf
+                    _df = await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda: _yf.download(symbol, period="1d", interval="1m",
+                                             progress=False, auto_adjust=True),
+                    )
+                    if not _df.empty:
+                        _row = _df.iloc[-1]
+                        bar = Candle(
+                            symbol=symbol,
+                            timestamp=now_utc,
+                            open=float(_row["Open"].iloc[0] if hasattr(_row["Open"], "iloc") else _row["Open"]),
+                            high=float(_row["High"].iloc[0] if hasattr(_row["High"], "iloc") else _row["High"]),
+                            low=float(_row["Low"].iloc[0] if hasattr(_row["Low"], "iloc") else _row["Low"]),
+                            close=float(_row["Close"].iloc[0] if hasattr(_row["Close"], "iloc") else _row["Close"]),
+                            volume=int(_row["Volume"].iloc[0] if hasattr(_row["Volume"], "iloc") else _row["Volume"]),
+                            timeframe="1m",
+                        )
+                except Exception as _e:
+                    logger.warning(f"[yfinance] bar fetch failed: {_e}")
+            else:
+                bars = await polygon.get_bars(symbol, today, multiplier=1, timespan="minute")
+                bar = bars[-1] if bars else None
+
+            if bar is None:
                 await asyncio.sleep(15)
                 continue
 
-            bar  = bars[-1]
             spot = bar.close
             executor.set_market_price(symbol, spot)
 
-            # Fetch options chain with greeks + OI + volume
-            contracts = await polygon.get_options_snapshot(symbol, max_dte=7)
+            # Fetch options chain with greeks + OI + volume (Polygon only — optional)
+            contracts = []
+            if not use_yfinance:
+                try:
+                    contracts = await polygon.get_options_snapshot(symbol, max_dte=7)
+                except Exception as _e:
+                    logger.debug(f"[ZeroDTE] options snapshot failed: {_e}")
             if not contracts:
-                logger.debug("[ZeroDTE] Empty options chain — waiting")
-                await asyncio.sleep(15)
-                continue
+                logger.debug("[ZeroDTE] No options chain — running without GEX walls")
 
             # Compute GEX walls (the core signal)
             walls = gex_engine.find_walls(contracts, spot, max_distance_pct=0.04, top_n=6)
